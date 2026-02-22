@@ -22,6 +22,7 @@ describe('s3-config', () => {
         delete process.env.OR3_STORAGE_S3_FORCE_PATH_STYLE;
         delete process.env.OR3_STORAGE_S3_KEY_PREFIX;
         delete process.env.OR3_STORAGE_S3_REQUIRE_CHECKSUM;
+        delete process.env.OR3_STORAGE_S3_ALLOW_INSECURE_HTTP;
     });
 
     it('rejects invalid TTL env values', () => {
@@ -85,5 +86,31 @@ describe('s3-config', () => {
         const diagnostics = validateS3StorageConfig(makeRuntimeConfig());
         expect(diagnostics.isValid).toBe(false);
         expect(diagnostics.errors).toContain('OR3_STORAGE_S3_ENDPOINT must be a valid URL.');
+    });
+
+    it('fails closed for insecure HTTP endpoint by default', () => {
+        process.env.OR3_STORAGE_S3_REGION = 'us-east-1';
+        process.env.OR3_STORAGE_S3_BUCKET = 'bucket';
+        process.env.OR3_STORAGE_S3_ACCESS_KEY_ID = 'ak';
+        process.env.OR3_STORAGE_S3_SECRET_ACCESS_KEY = 'sk';
+        process.env.OR3_STORAGE_S3_ENDPOINT = 'http://localhost:9000';
+
+        const diagnostics = validateS3StorageConfig(makeRuntimeConfig());
+        expect(diagnostics.isValid).toBe(false);
+        expect(diagnostics.errors).toContain(
+            'OR3_STORAGE_S3_ENDPOINT must use HTTPS unless OR3_STORAGE_S3_ALLOW_INSECURE_HTTP=true is explicitly set.'
+        );
+    });
+
+    it('allows explicit insecure HTTP endpoint override for local dev', () => {
+        process.env.OR3_STORAGE_S3_REGION = 'us-east-1';
+        process.env.OR3_STORAGE_S3_BUCKET = 'bucket';
+        process.env.OR3_STORAGE_S3_ACCESS_KEY_ID = 'ak';
+        process.env.OR3_STORAGE_S3_SECRET_ACCESS_KEY = 'sk';
+        process.env.OR3_STORAGE_S3_ENDPOINT = 'http://localhost:9000';
+        process.env.OR3_STORAGE_S3_ALLOW_INSECURE_HTTP = 'true';
+
+        const diagnostics = validateS3StorageConfig(makeRuntimeConfig());
+        expect(diagnostics.isValid).toBe(true);
     });
 });

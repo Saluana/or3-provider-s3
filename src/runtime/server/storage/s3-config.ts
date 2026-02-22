@@ -26,6 +26,7 @@ export interface S3StorageConfigDiagnostics {
 
 const DEFAULT_URL_TTL_SECONDS = 900;
 const MAX_URL_TTL_SECONDS = 24 * 60 * 60;
+const ALLOW_INSECURE_HTTP_ENV = 'OR3_STORAGE_S3_ALLOW_INSECURE_HTTP';
 
 function isStrictMode(runtimeConfig: ReturnType<typeof useRuntimeConfig>): boolean {
     if (process.env.OR3_STRICT_CONFIG === 'true') return true;
@@ -52,6 +53,15 @@ function parseUrlOrUndefined(value: string | undefined): string | undefined {
         return trimmed;
     } catch {
         return undefined;
+    }
+}
+
+function isHttpUrl(url: string | undefined): boolean {
+    if (!url) return false;
+    try {
+        return new URL(url).protocol === 'http:';
+    } catch {
+        return false;
     }
 }
 
@@ -116,6 +126,12 @@ export function validateS3StorageConfig(
 
     if (String(process.env.OR3_STORAGE_S3_ENDPOINT ?? '').trim() && !endpoint) {
         errors.push('OR3_STORAGE_S3_ENDPOINT must be a valid URL.');
+    }
+
+    if (isHttpUrl(endpoint) && process.env[ALLOW_INSECURE_HTTP_ENV] !== 'true') {
+        errors.push(
+            `OR3_STORAGE_S3_ENDPOINT must use HTTPS unless ${ALLOW_INSECURE_HTTP_ENV}=true is explicitly set.`
+        );
     }
 
     if (!region) errors.push('Missing OR3_STORAGE_S3_REGION.');

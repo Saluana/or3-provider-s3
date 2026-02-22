@@ -17,6 +17,7 @@ describe('s3 register plugin', () => {
         process.env.OR3_STORAGE_S3_SECRET_ACCESS_KEY = 'sk';
         delete process.env.OR3_STORAGE_S3_ENDPOINT;
         delete process.env.OR3_STORAGE_S3_URL_TTL_SECONDS;
+        delete process.env.OR3_STORAGE_S3_ALLOW_INSECURE_HTTP;
 
         (globalThis as typeof globalThis & { defineNitroPlugin?: unknown }).defineNitroPlugin =
             (plugin: () => unknown) => plugin();
@@ -40,6 +41,15 @@ describe('s3 register plugin', () => {
         delete process.env.OR3_STORAGE_S3_BUCKET;
 
         await expect(import('../register')).rejects.toThrow('Missing OR3_STORAGE_S3_BUCKET.');
+        expect(registerStorageGatewayAdapterMock).not.toHaveBeenCalled();
+    });
+
+    it('fails startup on insecure HTTP endpoint unless explicitly allowed', async () => {
+        process.env.OR3_STORAGE_S3_ENDPOINT = 'http://localhost:9000';
+
+        await expect(import('../register')).rejects.toThrow(
+            'OR3_STORAGE_S3_ENDPOINT must use HTTPS unless OR3_STORAGE_S3_ALLOW_INSECURE_HTTP=true is explicitly set.'
+        );
         expect(registerStorageGatewayAdapterMock).not.toHaveBeenCalled();
     });
 
