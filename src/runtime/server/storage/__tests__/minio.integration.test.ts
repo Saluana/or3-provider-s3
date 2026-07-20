@@ -101,6 +101,7 @@ describe('minio integration (opt-in)', () => {
 
         await adapter.commit({} as unknown as H3Event, {
             workspace_id: workspaceId,
+            intent_id: presignUp.intentId,
             hash,
             storage_id: presignUp.storageId,
             storage_provider_id: 's3',

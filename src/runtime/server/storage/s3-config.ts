@@ -25,7 +25,7 @@ export interface S3StorageConfigDiagnostics {
 }
 
 const DEFAULT_URL_TTL_SECONDS = 900;
-const MAX_URL_TTL_SECONDS = 24 * 60 * 60;
+const MAX_URL_TTL_SECONDS = 60 * 60;
 const ALLOW_INSECURE_HTTP_ENV = 'OR3_STORAGE_S3_ALLOW_INSECURE_HTTP';
 
 function isStrictMode(runtimeConfig: ReturnType<typeof useRuntimeConfig>): boolean {
@@ -71,11 +71,11 @@ export function resolveS3UrlTtlSeconds(): number {
 
     const parsed = Number(raw);
     if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
-        throw new Error('OR3_STORAGE_S3_URL_TTL_SECONDS must be an integer between 1 and 86400.');
+        throw new Error('OR3_STORAGE_S3_URL_TTL_SECONDS must be an integer between 1 and 3600.');
     }
 
     if (parsed < 1 || parsed > MAX_URL_TTL_SECONDS) {
-        throw new Error('OR3_STORAGE_S3_URL_TTL_SECONDS must be between 1 and 86400.');
+        throw new Error('OR3_STORAGE_S3_URL_TTL_SECONDS must be between 1 and 3600.');
     }
 
     return parsed;
@@ -112,7 +112,7 @@ export function validateS3StorageConfig(
         forcePathStyle,
         keyPrefix,
         urlTtlSeconds: DEFAULT_URL_TTL_SECONDS,
-        requireChecksum: parseBool(process.env.OR3_STORAGE_S3_REQUIRE_CHECKSUM),
+        requireChecksum: true,
     };
 
     const errors: string[] = [];
@@ -145,8 +145,10 @@ export function validateS3StorageConfig(
         errors.push((err as Error).message);
     }
 
-    if (config.requireChecksum) {
-        warnings.push('OR3_STORAGE_S3_REQUIRE_CHECKSUM=true; ensure your S3 host supports x-amz-checksum-sha256 for PutObject presigned URLs.');
+    if (process.env.OR3_STORAGE_S3_REQUIRE_CHECKSUM === 'false') {
+        errors.push('OR3_STORAGE_S3_REQUIRE_CHECKSUM=false is not supported; checksum enforcement is required.');
+    } else {
+        warnings.push('S3 uploads require x-amz-checksum-sha256 and a signed Content-Length; ensure your S3 host supports both headers.');
     }
 
     return {

@@ -28,20 +28,27 @@ describe('s3-config', () => {
     it('rejects invalid TTL env values', () => {
         process.env.OR3_STORAGE_S3_URL_TTL_SECONDS = 'not-a-number';
         expect(() => resolveS3UrlTtlSeconds()).toThrow(
-            'OR3_STORAGE_S3_URL_TTL_SECONDS must be an integer between 1 and 86400.'
+            'OR3_STORAGE_S3_URL_TTL_SECONDS must be an integer between 1 and 3600.'
         );
     });
 
     it('rejects out-of-range TTL env values', () => {
         process.env.OR3_STORAGE_S3_URL_TTL_SECONDS = '0';
         expect(() => resolveS3UrlTtlSeconds()).toThrow(
-            'OR3_STORAGE_S3_URL_TTL_SECONDS must be between 1 and 86400.'
+            'OR3_STORAGE_S3_URL_TTL_SECONDS must be between 1 and 3600.'
         );
     });
 
     it('accepts valid TTL from env', () => {
         process.env.OR3_STORAGE_S3_URL_TTL_SECONDS = '120';
         expect(resolveS3UrlTtlSeconds()).toBe(120);
+    });
+
+    it('rejects URL lifetimes longer than one hour', () => {
+        process.env.OR3_STORAGE_S3_URL_TTL_SECONDS = '3601';
+        expect(() => resolveS3UrlTtlSeconds()).toThrow(
+            'OR3_STORAGE_S3_URL_TTL_SECONDS must be between 1 and 3600.'
+        );
     });
 
     it('validates required env vars', () => {
@@ -62,6 +69,21 @@ describe('s3-config', () => {
         const diagnostics = validateS3StorageConfig(makeRuntimeConfig());
         expect(diagnostics.isValid).toBe(true);
         expect(diagnostics.config.keyPrefix).toBe('');
+        expect(diagnostics.config.requireChecksum).toBe(true);
+    });
+
+    it('rejects disabling checksum enforcement', () => {
+        process.env.OR3_STORAGE_S3_REGION = 'us-east-1';
+        process.env.OR3_STORAGE_S3_BUCKET = 'bucket';
+        process.env.OR3_STORAGE_S3_ACCESS_KEY_ID = 'ak';
+        process.env.OR3_STORAGE_S3_SECRET_ACCESS_KEY = 'sk';
+        process.env.OR3_STORAGE_S3_REQUIRE_CHECKSUM = 'false';
+
+        const diagnostics = validateS3StorageConfig(makeRuntimeConfig());
+        expect(diagnostics.isValid).toBe(false);
+        expect(diagnostics.errors).toContain(
+            'OR3_STORAGE_S3_REQUIRE_CHECKSUM=false is not supported; checksum enforcement is required.'
+        );
     });
 
     it('normalizes key prefix with trailing slash', () => {
