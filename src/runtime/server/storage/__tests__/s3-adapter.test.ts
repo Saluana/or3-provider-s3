@@ -325,13 +325,14 @@ describe('S3StorageGatewayAdapter', () => {
             size_bytes: 3, name: 'a.png', kind: 'image' as const,
         };
         const expired = makeAdapter();
-        (expired.send as any).mockImplementation(async (command: unknown) => {
+        expired.send.mockImplementation(async (command: unknown) => {
             if (command instanceof HeadObjectCommand) return {
                 ContentLength: 3, ContentType: 'image/png', ChecksumSHA256: CHECKSUM,
                 Metadata: {
                     'or3-workspace': 'ws1', 'or3-hash': HASH, 'or3-intent': INTENT_ID,
                     'or3-intent-expires': '999999',
                 },
+                ETag: '"etag"',
             };
             return {};
         });
@@ -340,13 +341,14 @@ describe('S3StorageGatewayAdapter', () => {
         expect(expired.send.mock.calls.some(([command]) => command instanceof PutObjectCommand)).toBe(false);
 
         const mutated = makeAdapter();
-        (mutated.send as any).mockImplementation(async (command: unknown) => {
+        mutated.send.mockImplementation(async (command: unknown) => {
             if (command instanceof HeadObjectCommand) return {
                 ContentLength: 3, ContentType: 'image/png', ChecksumSHA256: 'wrong',
                 Metadata: {
                     'or3-workspace': 'ws1', 'or3-hash': HASH, 'or3-intent': INTENT_ID,
                     'or3-intent-expires': '1000001',
                 },
+                ETag: '"etag"',
             };
             return {};
         });
