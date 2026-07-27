@@ -177,6 +177,39 @@ describe('S3StorageGatewayAdapter', () => {
         })).rejects.toMatchObject({ statusCode: 400 });
     });
 
+    it('deletes the derived blob and marker and remains idempotent on retry', async () => {
+        const { adapter, send } = makeAdapter();
+        const input = {
+            workspaceId: 'ws1',
+            hash: HASH,
+            storageId: `ws1/${HASH}`,
+        };
+
+        await expect(adapter.deleteObject({} as H3Event, input)).resolves.toBeUndefined();
+        await expect(adapter.deleteObject({} as H3Event, input)).resolves.toBeUndefined();
+
+        const keys = send.mock.calls
+            .map(([command]) => command)
+            .filter((command) => command instanceof DeleteObjectCommand)
+            .map((command) => command.input.Key);
+        expect(keys).toEqual([
+            `ws1/${HASH}`,
+            `ws1/${HASH}.meta.json`,
+            `ws1/${HASH}`,
+            `ws1/${HASH}.meta.json`,
+        ]);
+    });
+
+    it('rejects a mismatched delete storage_id before issuing an S3 command', async () => {
+        const { adapter, send } = makeAdapter();
+        await expect(adapter.deleteObject({} as H3Event, {
+            workspaceId: 'ws1',
+            hash: HASH,
+            storageId: `ws2/${HASH}`,
+        })).rejects.toMatchObject({ statusCode: 400 });
+        expect(send).not.toHaveBeenCalled();
+    });
+
     it('commit validates head and writes marker', async () => {
         const { adapter, send } = makeAdapter();
         await adapter.commit({} as H3Event, {

@@ -17,6 +17,7 @@ import type {
     PresignUploadResponse,
     PresignDownloadRequest,
     PresignDownloadResponse,
+    DeleteObjectRequest,
 } from '~~/server/storage/gateway/types';
 import type { CanonicalStorageQueryKind, SyncGatewayAdapter } from '~~/server/sync/gateway/types';
 import { getActiveSyncGatewayAdapter } from '~~/server/sync/gateway/registry';
@@ -417,6 +418,31 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
                 storageId: body.storage_id,
             });
         }
+    }
+
+    async deleteObject(_event: H3Event, input: DeleteObjectRequest): Promise<void> {
+        const objectKey = buildS3ObjectKey({
+            keyPrefix: this.cfg.keyPrefix,
+            workspaceId: input.workspaceId,
+            hash: input.hash,
+        });
+        if (input.storageId !== undefined && input.storageId !== objectKey) {
+            throw createError({
+                statusCode: 400,
+                statusMessage: 'storage_id does not match expected object key',
+            });
+        }
+
+        // S3 DeleteObject is idempotent. Delete both the blob and its commit
+        // marker so retries also heal a partially completed prior attempt.
+        await this.clientInstance.send(new DeleteObjectCommand({
+            Bucket: this.cfg.bucket,
+            Key: objectKey,
+        }));
+        await this.clientInstance.send(new DeleteObjectCommand({
+            Bucket: this.cfg.bucket,
+            Key: buildS3MarkerKey(objectKey),
+        }));
     }
 
     async gc(
