@@ -8,5 +8,13 @@
 import type { RuntimeConfigLike } from './runtime-config';
 
 export const useRuntimeConfig: () => RuntimeConfigLike = () => {
-    throw new Error('#imports shim — should never run at runtime');
+	const runtimeConfig = (
+		globalThis as typeof globalThis & {
+			useRuntimeConfig?: () => RuntimeConfigLike;
+		}
+	).useRuntimeConfig;
+	if (runtimeConfig) {
+		return runtimeConfig();
+	}
+	throw new Error('#imports shim — should never run at runtime');
 };
