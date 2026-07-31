@@ -1,6 +1,7 @@
 /**
  * Nitro server plugin — registers the S3 storage adapter.
  */
+import { defineNitroPlugin } from 'nitropack/runtime/plugin';
 import { registerStorageGatewayAdapter } from '~~/server/storage/gateway/registry';
 import { validateS3StorageConfig } from '../storage/s3-config';
 import { createS3StorageGatewayAdapter } from '../storage/s3-storage-gateway-adapter';

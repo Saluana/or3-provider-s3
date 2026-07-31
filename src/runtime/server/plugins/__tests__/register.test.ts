@@ -2,6 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const registerStorageGatewayAdapterMock = vi.hoisted(() => vi.fn());
 
+vi.mock('nitropack/runtime/plugin', () => ({
+    defineNitroPlugin: (plugin: () => unknown) => plugin(),
+}));
+
 vi.mock('~~/server/storage/gateway/registry', () => ({
     registerStorageGatewayAdapter: registerStorageGatewayAdapterMock as unknown,
 }));
@@ -19,8 +23,6 @@ describe('s3 register plugin', () => {
         delete process.env.OR3_STORAGE_S3_URL_TTL_SECONDS;
         delete process.env.OR3_STORAGE_S3_ALLOW_INSECURE_HTTP;
 
-        (globalThis as typeof globalThis & { defineNitroPlugin?: unknown }).defineNitroPlugin =
-            (plugin: () => unknown) => plugin();
         (globalThis as typeof globalThis & { useRuntimeConfig?: unknown }).useRuntimeConfig = () => ({
             auth: { enabled: true, strict: false },
             storage: { enabled: true, provider: 's3' },
