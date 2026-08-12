@@ -13,8 +13,20 @@ permissions:
 jobs:
   qualify:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: provider
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: provider
+      # Full provider tests exercise the host contract through the sibling checkout.
+      # Keep this immutable ref aligned with the generated standalone contract.
+      - uses: actions/checkout@v4
+        with:
+          repository: Saluana/or3-chat
+          ref: 702bb6604a588a9d29f5df9fe60f56fdab05b92c
+          path: or3-chat
       - uses: actions/setup-node@v4
         with:
           node-version: 24
