@@ -92,7 +92,9 @@ Client
   │                                        size, MIME, checksum, intent expiry,
   │                                        then write <key>.meta.json marker
   │
-  ├─ POST /api/storage/presign-download ──► presignDownload(): signed GET URL
+  ├─ POST /api/storage/presign-download ──► host endpoint verifies live canonical
+  │                                        metadata; presignDownload() verifies the
+  │                                        blob + commit marker, then signs GET
   │
   └─ GET  https://bucket/.../<key>      ──► direct from S3 using the signed URL
 ```
@@ -112,7 +114,7 @@ Keys are derived, not client-chosen. The object key is always `<prefix><workspac
 
 - **Server-only credentials.** The `S3Client` is built with your access key and secret inside the Nitro server. The browser only ever receives signed URLs.
 - **Short-lived URLs.** Signed URLs default to 15 minutes. The hard cap is one hour, even if a caller asks for longer.
-- **Operation scope.** A signed `PUT` URL can only upload; a signed `GET` URL can only download.
+- **Operation scope.** A signed `PUT` URL can only upload; a signed `GET` URL can only download. The host endpoint requires live canonical workspace metadata, and the adapter additionally requires both the blob and commit marker before signing.
 - **Key validation.** Workspace IDs must match `[a-zA-Z0-9_-]+` and hashes must be canonical `sha256:<64 hex>`. A caller-supplied `storage_id` that does not match the derived key is rejected with 400 on download, commit, and delete.
 - **Upload binding.** Presigned uploads require the declared `Content-Length` and an `x-amz-checksum-sha256` header. Commit verifies the stored object's size, MIME type, checksum, workspace/hash/intent metadata, and intent expiry (410 when expired). Any mismatch deletes the uploaded blob and fails the commit.
 - **Single commit.** The commit marker is written with `IfNoneMatch: *`, so a commit succeeds exactly once. A duplicate commit returns 409.

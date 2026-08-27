@@ -288,6 +288,24 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
 
         const key = derivedKey;
 
+        // The marker is the provider's commit boundary. A raw object can be
+        // left behind by an interrupted upload and must never be presigned.
+        try {
+            await this.clientInstance.send(new HeadObjectCommand({
+                Bucket: this.cfg.bucket,
+                Key: buildS3MarkerKey(key),
+            }));
+            await this.clientInstance.send(new HeadObjectCommand({
+                Bucket: this.cfg.bucket,
+                Key: key,
+            }));
+        } catch (error) {
+            if (isNotFoundError(error)) {
+                throw createError({ statusCode: 404, statusMessage: 'File not found' });
+            }
+            throw createError({ statusCode: 502, statusMessage: 'S3 object verification failed' });
+        }
+
         const expiresIn = expiresInMsToSeconds(input.expiresInMs, this.cfg.urlTtlSeconds);
 
         const command = new GetObjectCommand({

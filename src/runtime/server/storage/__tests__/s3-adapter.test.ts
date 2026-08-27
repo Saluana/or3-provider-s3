@@ -177,6 +177,27 @@ describe('S3StorageGatewayAdapter', () => {
         })).rejects.toMatchObject({ statusCode: 400 });
     });
 
+    it('rejects a raw object without a committed marker', async () => {
+        const send = vi.fn(async (command: unknown) => {
+            if (command instanceof HeadObjectCommand && command.input.Key?.endsWith('.meta.json')) {
+                throw Object.assign(new Error('missing marker'), { name: 'NotFound' });
+            }
+            return {};
+        });
+        const adapter = new S3StorageGatewayAdapter({
+            region: 'us-east-1', bucket: 'bucket', accessKeyId: 'ak', secretAccessKey: 'sk',
+            forcePathStyle: false, keyPrefix: '', urlTtlSeconds: 900, requireChecksum: true,
+        }, {
+            client: { send },
+        });
+
+        await expect(adapter.presignDownload({} as H3Event, {
+            workspaceId: 'ws1',
+            hash: HASH,
+        })).rejects.toMatchObject({ statusCode: 404 });
+        expect(signedUrlMock).not.toHaveBeenCalled();
+    });
+
     it('deletes the derived blob and marker and remains idempotent on retry', async () => {
         const { adapter, send } = makeAdapter();
         const input = {
