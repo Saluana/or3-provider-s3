@@ -34,7 +34,7 @@ type CommitInput = {
     mime_type: string;
     size_bytes: number;
     name: string;
-    kind: 'image' | 'pdf';
+    kind: 'image' | 'pdf' | 'file';
     width?: number;
     height?: number;
     page_count?: number;
@@ -77,7 +77,7 @@ function assertInt(value: unknown, message: string, opts?: { min?: number; optio
 function parseCommitInput(input: unknown): CommitInput {
     const obj = assertObject(input, 'Invalid commit payload');
     const kind = assertString(obj.kind, 'Invalid kind');
-    if (kind !== 'image' && kind !== 'pdf') {
+    if (kind !== 'image' && kind !== 'pdf' && kind !== 'file') {
         throw createError({ statusCode: 400, statusMessage: 'Invalid kind' });
     }
 
@@ -121,6 +121,35 @@ function expiresInMsToSeconds(expiresInMs: number | undefined, fallbackSeconds: 
 
 function normalizeMime(value: string): string {
     return value.split(';', 1)[0]?.trim().toLowerCase() || value.trim().toLowerCase();
+}
+
+const SAFE_INLINE_MIME_TYPES = new Set([
+    'image/png',
+    'image/jpeg',
+    'image/webp',
+    'image/gif',
+    'application/pdf',
+]);
+
+function resolveDownloadHeaders(input: PresignDownloadRequest): {
+    mimeType: string;
+    disposition: 'inline' | 'attachment';
+    filename: string;
+} {
+    const requestedMime = normalizeMime(input.mimeType ?? '');
+    const safeInline = SAFE_INLINE_MIME_TYPES.has(requestedMime);
+    const mimeType = safeInline ? requestedMime : 'application/octet-stream';
+    const disposition = safeInline && input.disposition === 'inline'
+        ? 'inline'
+        : 'attachment';
+    const filename = (input.filename ?? 'download')
+        .normalize('NFKC')
+        .replace(/[\u0000-\u001f\u007f]/g, '_')
+        .replace(/[\\/]+/g, '_')
+        .trim()
+        .replace(/^\.+$/, '')
+        .slice(0, 180) || 'download';
+    return { mimeType, disposition, filename };
 }
 
 const MAX_UPLOAD_SIZE_BYTES = 100 * 1024 * 1024;
@@ -197,8 +226,8 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
 
     async presignUpload(event: H3Event, input: PresignUploadRequest): Promise<PresignUploadResponse> {
         void event;
-        if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 1) {
-            throw createError({ statusCode: 400, statusMessage: 'Upload size must be a positive integer' });
+        if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0) {
+            throw createError({ statusCode: 400, statusMessage: 'Upload size must be a nonnegative integer' });
         }
         if (input.sizeBytes > MAX_UPLOAD_SIZE_BYTES) {
             throw createError({ statusCode: 413, statusMessage: `Upload exceeds ${MAX_UPLOAD_SIZE_BYTES} byte limit` });
@@ -307,11 +336,14 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
         }
 
         const expiresIn = expiresInMsToSeconds(input.expiresInMs, this.cfg.urlTtlSeconds);
+        const downloadHeaders = resolveDownloadHeaders(input);
 
         const command = new GetObjectCommand({
             Bucket: this.cfg.bucket,
             Key: key,
-            ...(input.disposition ? { ResponseContentDisposition: input.disposition } : {}),
+            ResponseContentType: downloadHeaders.mimeType,
+            ResponseContentDisposition:
+                `${downloadHeaders.disposition}; filename*=UTF-8''${encodeURIComponent(downloadHeaders.filename)}`,
         });
 
         const url = await getSignedUrl(this.clientInstance as S3Client, command, { expiresIn });

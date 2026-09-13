@@ -6,6 +6,7 @@ import type {
 } from '~~/server/sync/gateway/types';
 import {
     HeadObjectCommand,
+    GetObjectCommand,
     PutObjectCommand,
     DeleteObjectCommand,
     ListObjectsV2Command,
@@ -111,6 +112,16 @@ describe('S3StorageGatewayAdapter', () => {
         expect(signedUrlMock).not.toHaveBeenCalled();
     });
 
+    it('allows a zero-byte upload', async () => {
+        const { adapter } = makeAdapter();
+        await expect(adapter.presignUpload({} as H3Event, {
+            workspaceId: 'ws1',
+            hash: HASH,
+            mimeType: 'application/octet-stream',
+            sizeBytes: 0,
+        })).resolves.toMatchObject({ method: 'PUT', storageId: `ws1/${HASH}` });
+    });
+
     it('persists quota reservation before signing and binds the returned intent', async () => {
         const reserveUploadIntent = vi.fn(async () => undefined);
         const adapter = new S3StorageGatewayAdapter({
@@ -140,12 +151,14 @@ describe('S3StorageGatewayAdapter', () => {
         expect(signedUrlMock).not.toHaveBeenCalled();
     });
 
-    it('presigns download and forwards disposition', async () => {
+    it('presigns download with canonical safe response headers', async () => {
         const { adapter } = makeAdapter();
         const result = await adapter.presignDownload({} as H3Event, {
             workspaceId: 'ws1',
             hash: HASH,
             disposition: 'attachment',
+            mimeType: 'text/html',
+            filename: '../../evil\r\n.html',
             expiresInMs: 1000,
         });
 
@@ -153,6 +166,11 @@ describe('S3StorageGatewayAdapter', () => {
         expect(result.storageId).toBe(`ws1/${HASH}`);
         expect(result.expiresAt).toBe(1_000_000 + 1 * 1000);
         expect(signedUrlMock).toHaveBeenCalled();
+        const command = (signedUrlMock.mock.calls.at(-1) as unknown[])[1] as GetObjectCommand;
+        expect(command.input.ResponseContentType).toBe('application/octet-stream');
+        expect(command.input.ResponseContentDisposition).toBe(
+            "attachment; filename*=UTF-8''.._.._evil__.html",
+        );
     });
 
     it('caps caller-requested signed URLs at one hour', async () => {
