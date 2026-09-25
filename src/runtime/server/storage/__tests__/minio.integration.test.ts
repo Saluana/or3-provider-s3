@@ -37,14 +37,11 @@ function sha256HashOf(bytes: Uint8Array): string {
     return `sha256:${hex}`;
 }
 
-describe('minio integration (opt-in)', () => {
-    const enabled = process.env.OR3_S3_INTEGRATION_TESTS === 'true';
+const describeMinioIntegration = process.env.OR3_S3_INTEGRATION_TESTS === 'true'
+    ? describe
+    : describe.skip;
 
-    if (!enabled) {
-        it('skipped (set OR3_S3_INTEGRATION_TESTS=true to enable)', () => {});
-        return;
-    }
-
+describeMinioIntegration('minio integration (opt-in)', () => {
     it('presign → PUT → commit → presign → GET roundtrip', async () => {
         const endpoint = maybeEnv('OR3_STORAGE_S3_ENDPOINT');
         const region = envOrThrow('OR3_STORAGE_S3_REGION');
