@@ -29,7 +29,7 @@ jobs:
       # commit SHA. The default is the current coordinated Chat revision.
       - name: Validate OR3 Chat contract reference
         env:
-          CONTRACT_REF: ${{ vars.OR3_CHAT_CONTRACT_REF || 'dc8a5bc7f75298e87ae022d5e794885bf554e41d' }}
+          CONTRACT_REF: ${{ vars.OR3_CHAT_CONTRACT_REF || '88f5d236db1bbb3488705ebe2a42d94fcf62b8df' }}
         run: |
           if ! [[ "$CONTRACT_REF" =~ ^[0-9a-f]{40}$ ]]; then
             echo 'OR3_CHAT_CONTRACT_REF must be a 40-character commit SHA.' >&2
@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: Saluana/or3-chat
-          ref: ${{ vars.OR3_CHAT_CONTRACT_REF || 'dc8a5bc7f75298e87ae022d5e794885bf554e41d' }}
+          ref: ${{ vars.OR3_CHAT_CONTRACT_REF || '88f5d236db1bbb3488705ebe2a42d94fcf62b8df' }}
           path: or3-chat
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
