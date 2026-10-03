@@ -9,7 +9,7 @@ S3-compatible storage provider for [OR3 Chat](https://github.com/or3-chat/or3-ch
 - Keeps S3 credentials **server-only** — they never reach the browser.
 - Binds every upload to a declared SHA-256 checksum and exact content length.
 - Verifies uploads on commit (size, MIME type, checksum, intent expiry) before accepting them.
-- Works with AWS S3, Cloudflare R2, MinIO, Backblaze B2, and other S3-compatible hosts.
+- Targets AWS S3 and S3-compatible hosts that implement the required checksum and conditional-write operations.
 
 **This is a storage-only provider.** It does not provide auth or sync. Pair it with an auth provider and a sync provider for a complete stack.
 
@@ -99,7 +99,7 @@ Client
   └─ GET  https://bucket/.../<key>      ──► direct from S3 using the signed URL
 ```
 
-Deletes are server-side: `deleteObject` derives the key from the workspace and hash, rejects a mismatched `storage_id`, and idempotently removes the blob and its commit marker.
+Deletes are server-side: `deleteObject` derives the key from the workspace and hash, rejects a mismatched `storage_id`, and fails with 503 while the object or marker exists because deletion requires provider-owned coordination. An already absent pair succeeds.
 
 ### Object Layout
 
@@ -116,7 +116,7 @@ Keys are derived, not client-chosen. The object key is always `<prefix><workspac
 - **Short-lived URLs.** Signed URLs default to 15 minutes. The hard cap is one hour, even if a caller asks for longer.
 - **Operation scope.** A signed `PUT` URL can only upload; a signed `GET` URL can only download. The host endpoint requires live canonical workspace metadata, and the adapter additionally requires both the blob and commit marker before signing.
 - **Key validation.** Workspace IDs must match `[a-zA-Z0-9_-]+` and hashes must be canonical `sha256:<64 hex>`. A caller-supplied `storage_id` that does not match the derived key is rejected with 400 on download, commit, and delete.
-- **Upload binding.** Presigned uploads require the declared `Content-Length` and an `x-amz-checksum-sha256` header. Commit verifies the stored object's size, MIME type, checksum, workspace/hash/intent metadata, and intent expiry (410 when expired). Any mismatch deletes the uploaded blob and fails the commit.
+- **Upload binding.** Presigned uploads require the declared `Content-Length` and an `x-amz-checksum-sha256` header. Commit verifies the stored object's size, MIME type, checksum, workspace/hash/intent metadata, and intent expiry (410 when expired). A mismatch fails the commit without deleting the stored blob; a malformed request must not erase a previously committed object.
 - **Safe downloads.** The host supplies canonical response overrides. Generic or active content is signed as an `application/octet-stream` attachment; supported raster images and PDFs may remain inline. S3 direct responses cannot add `X-Content-Type-Options`, so the attachment/octet-stream policy is applied in the signed request.
 - **Empty files.** Zero-byte uploads are accepted when the signed size and checksum match.
 - **Single commit.** The commit marker is written with `IfNoneMatch: *`, so a commit succeeds exactly once. A duplicate commit returns 409.
@@ -137,25 +137,25 @@ The exact CORS JSON varies by host; AWS, R2, MinIO, and B2 all support equivalen
 
 ## Checksum Behavior
 
-Uploads always require the `x-amz-checksum-sha256` header and a signed `Content-Length`. Both are returned with the presigned upload response, and the commit verifies the stored object's checksum against the declared hash. A startup warning reminds you to confirm your S3 host supports both headers; disabling enforcement (`OR3_STORAGE_S3_REQUIRE_CHECKSUM=false`) is rejected.
+Uploads always require the `x-amz-checksum-sha256` header and a signed `Content-Length`. Both are returned with the presigned upload response. Commit requests `ChecksumMode: ENABLED` on HEAD and verifies the returned SHA-256 checksum against the declared hash. AWS requires this mode to retrieve checksums ([HeadObject API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html)); SSE-KMS buckets also require the relevant KMS permissions. A startup warning reminds you to confirm your S3 host supports both headers; disabling enforcement (`OR3_STORAGE_S3_REQUIRE_CHECKSUM=false`) is rejected.
 
 ## Garbage Collection Safety
 
-Destructive blob GC only runs when the active sync provider supplies canonical, workspace-scoped materialized reference state (via `queryCanonicalStorage`). Without that capability, GC fails closed:
+Like filesystem storage, S3 cannot atomically coordinate physical object deletion
+with metadata restores and reference writes in a separate sync database. Canonical
+reference queries alone do not prevent this race. Destructive deletion and GC stay
+disabled until the provider owns a deletion barrier honored by those writes.
+
+GC validates its request and returns without listing or deleting objects:
 
 ```json
-{ "deleted_count": 0, "status": "disabled", "reason": "canonical_reference_state_required" }
+{ "deleted_count": 0, "status": "disabled", "reason": "deletion_coordination_required" }
 ```
 
-No S3 listing or delete commands are issued in that case. When the capability exists, GC:
-
-- lists a bounded set of candidates (500 max, at most 10 listing pages),
-- HEADs both the blob and its commit marker so listing order is never treated as evidence of a missing counterpart,
-- skips anything whose `LastModified` is missing or newer than the retention cutoff,
-- checks canonical `live_metadata` and `reference_edges` for every candidate, and rechecks immediately before each delete to close the mark/sweep race,
-- deletes blob and marker together, and reports `status: "completed"` with `deleted_count`.
-
-Liveness is always derived from canonical materialized reference state, never reconstructed from partial object listings.
+The admin storage card exposes non-secret configuration diagnostics and a
+**Check Storage GC Status** action. It reports the same disabled reason, including
+when canonical reference queries are available. Files and Trash use the selected
+sync provider's canonical metadata; selecting S3 changes where bytes live.
 
 ## Backup
 
@@ -174,7 +174,21 @@ bun run type-check  # TypeScript check
 bun run build       # Build the nuxt module
 ```
 
-Additional scripts: `bun run lint` and `bun run type-check:standalone`. An opt-in MinIO round-trip suite runs when `OR3_S3_INTEGRATION_TESTS=true` and the `OR3_STORAGE_S3_*` variables point at a test bucket.
+Additional scripts: `bun run lint` and `bun run type-check:standalone`.
+CI runs the live suite against disposable MinIO on every PR and main/tag qualification
+and uploads a JSON test report. The suite verifies image/PDF/generic and zero-byte
+round trips, pending-download denial, safe response headers, failed-commit blob
+preservation, and disabled destructive deletion/GC.
+
+To repeat it against your chosen host, configure `OR3_STORAGE_S3_*` for an existing
+**disposable test bucket** (including endpoint, path style, and optional key prefix), then run:
+
+```bash
+OR3_S3_INTEGRATION_TESTS=true bun run test src/runtime/server/storage/__tests__/minio.integration.test.ts --reporter=dot --reporter=json --outputFile=/tmp/or3-s3-integration.json
+```
+
+Each case uses a unique workspace key and removes its own blobs/markers in `finally`.
+The report is a repeatable verification artifact; this suite does not exercise browser CORS or host sign-in.
 
 ## Troubleshooting
 
@@ -185,7 +199,7 @@ Additional scripts: `bun run lint` and `bun run type-check:standalone`. An opt-i
 | Startup: `OR3_STORAGE_S3_URL_TTL_SECONDS must be between 1 and 3600` | TTL outside the allowed range or not an integer | Set the TTL to an integer from 1 to 3600 |
 | Browser PUT fails with a CORS error | Bucket CORS does not allow the origin/headers | Add `GET`, `PUT`, `HEAD`, `Content-Type` and `x-amz-*` headers, and expose `ETag` and `Content-Length` (see Bucket CORS) |
 | Commit: `Uploaded file not found` (404) | Nothing was uploaded, often because the browser PUT was blocked | Check bucket CORS and that the client sent the returned headers |
-| Commit: `Uploaded object checksum mismatch` / `size mismatch` / `content-type mismatch` (400) | Bytes, size, or MIME changed between presign and PUT | Re-upload using the exact size and type from presign; the failed object is deleted automatically |
+| Commit: `Uploaded object checksum mismatch` / `size mismatch` / `content-type mismatch` (400) | Bytes, size, or MIME changed between presign and PUT | Re-upload using the exact size and type from presign; the stored object is preserved |
 | Commit: `Upload intent expired` (410) | Commit happened after the upload URL expired | Presign again and upload before the TTL passes |
 | Commit: `Upload intent already consumed` (409) | The same upload was committed twice | Treat as success; the first commit won the race |
 | Upload: 413 `Upload exceeds ... byte limit` | File larger than 100 MB | Keep uploads under the 100 MB cap |
@@ -196,7 +210,7 @@ Additional scripts: `bun run lint` and `bun run type-check:standalone`. An opt-i
 
 ## Compatibility
 
-Works with any auth/sync provider combo — this package only handles storage. Tested against AWS S3, Cloudflare R2, MinIO, and Backblaze B2-style hosts via the `endpoint`/`forcePathStyle` options. Hosts must support presigned PUT with `x-amz-checksum-sha256` and a signed `Content-Length`.
+This package handles storage and uses the host auth/sync gateways. The live integration suite verifies MinIO. Other hosts must support presigned PUT with `x-amz-checksum-sha256` and signed `Content-Length`, checksum retrieval on HEAD, and conditional marker writes (`If-None-Match: *`). Run the opt-in suite against a disposable bucket on your chosen host before deployment; an S3-compatible endpoint alone does not establish compatibility.
 
 See the host documentation for the full cloud setup: `public/_documentation/cloud/provider-s3.md` in the OR3 Chat repo.
 

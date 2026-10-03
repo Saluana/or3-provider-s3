@@ -71,6 +71,43 @@ jobs:
       - run: bun run type-check
       - run: bun run type-check:standalone
       - run: bun run test
+      - name: Start disposable S3 compatibility server
+        run: |
+          set -euo pipefail
+          docker run -d --name or3-s3-ci -p 127.0.0.1:19091:9000 \
+            -e MINIO_ROOT_USER=or3-local-test \
+            -e MINIO_ROOT_PASSWORD=or3-disposable-test-secret \
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
+          for attempt in {1..20}; do
+            if curl --fail --silent http://127.0.0.1:19091/minio/health/ready; then exit 0; fi
+            sleep 1
+          done
+          docker logs or3-s3-ci
+          exit 1
+      - name: Verify real S3 upload and download lifecycle
+        env:
+          OR3_S3_INTEGRATION_TESTS: "true"
+          OR3_STORAGE_S3_ENDPOINT: http://127.0.0.1:19091
+          OR3_STORAGE_S3_REGION: us-east-1
+          OR3_STORAGE_S3_BUCKET: or3-parity-test
+          OR3_STORAGE_S3_ACCESS_KEY_ID: or3-local-test
+          OR3_STORAGE_S3_SECRET_ACCESS_KEY: or3-disposable-test-secret
+          OR3_STORAGE_S3_FORCE_PATH_STYLE: "true"
+          OR3_STORAGE_S3_KEY_PREFIX: parity/
+        run: |
+          set -euo pipefail
+          bun -e 'import {S3Client, CreateBucketCommand} from "@aws-sdk/client-s3"; const client = new S3Client({endpoint: process.env.OR3_STORAGE_S3_ENDPOINT, region: process.env.OR3_STORAGE_S3_REGION, forcePathStyle: true, credentials: {accessKeyId: process.env.OR3_STORAGE_S3_ACCESS_KEY_ID, secretAccessKey: process.env.OR3_STORAGE_S3_SECRET_ACCESS_KEY}}); await client.send(new CreateBucketCommand({Bucket: process.env.OR3_STORAGE_S3_BUCKET})); client.destroy();'
+          bun run test src/runtime/server/storage/__tests__/minio.integration.test.ts --reporter=dot --reporter=json --outputFile="$RUNNER_TEMP/s3-integration.json"
+      - name: Save S3 compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: s3-integration-evidence
+          path: ${{ runner.temp }}/s3-integration.json
+          if-no-files-found: warn
+      - name: Remove disposable S3 server
+        if: always()
+        run: docker rm -f or3-s3-ci || true
       - run: bun run build
       - name: Validate package archive
         run: npm pack --dry-run --json > "$RUNNER_TEMP/package-pack.json"

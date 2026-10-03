@@ -4,6 +4,8 @@
 import { useRuntimeConfig } from '#imports';
 import { defineNitroPlugin } from 'nitropack/runtime/plugin';
 import { registerStorageGatewayAdapter } from '~~/server/storage/gateway/registry';
+import { registerProviderAdminAdapter } from '~~/server/admin/providers/registry';
+import { s3StorageAdminAdapter } from '../admin/adapters/storage-s3';
 import { validateS3StorageConfig } from '../storage/s3-config';
 import { createS3StorageGatewayAdapter } from '../storage/s3-storage-gateway-adapter';
 
@@ -27,4 +29,5 @@ export default defineNitroPlugin(() => {
         order: 100,
         create: createS3StorageGatewayAdapter,
     });
+    registerProviderAdminAdapter(s3StorageAdminAdapter);
 });

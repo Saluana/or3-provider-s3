@@ -42,7 +42,11 @@ const describeMinioIntegration = process.env.OR3_S3_INTEGRATION_TESTS === 'true'
     : describe.skip;
 
 describeMinioIntegration('minio integration (opt-in)', () => {
-    it('presign → PUT → commit → presign → GET roundtrip', async () => {
+    it.each([
+        { mimeType: 'image/png', kind: 'image' as const, content: 'or3-s3-image', disposition: 'inline' },
+        { mimeType: 'application/pdf', kind: 'pdf' as const, content: 'or3-s3-pdf', disposition: 'inline' },
+        { mimeType: 'text/plain', kind: 'file' as const, content: '', disposition: 'attachment' },
+    ])('presign → PUT → commit → GET roundtrip for $mimeType', async ({ mimeType, kind, content, disposition }) => {
         const endpoint = maybeEnv('OR3_STORAGE_S3_ENDPOINT');
         const region = envOrThrow('OR3_STORAGE_S3_REGION');
         const bucket = envOrThrow('OR3_STORAGE_S3_BUCKET');
@@ -70,72 +74,98 @@ describeMinioIntegration('minio integration (opt-in)', () => {
                 secretAccessKey,
                 sessionToken,
                 forcePathStyle: process.env.OR3_STORAGE_S3_FORCE_PATH_STYLE === 'true',
-                keyPrefix: '',
+                keyPrefix: (maybeEnv('OR3_STORAGE_S3_KEY_PREFIX') ?? '').replace(/\/?$/, '/').replace(/^\/$/, ''),
                 urlTtlSeconds: 60,
-                requireChecksum: process.env.OR3_STORAGE_S3_REQUIRE_CHECKSUM === 'true',
+                requireChecksum: true,
             },
-            { client }
+            { client, getSyncGateway: () => undefined }
         );
 
-        // Fake PNG bytes (content correctness isn't validated by OR3; hash is).
-        const bytes = new TextEncoder().encode('or3-s3-integration');
+        // The provider validates the hash, size and MIME, not the file format.
+        const bytes = new TextEncoder().encode(content);
         const hash = sha256HashOf(bytes);
-        const workspaceId = 'ws_s3_test';
+        const workspaceId = `ws_s3_test_${crypto.randomUUID().replaceAll('-', '')}`;
 
         const presignUp = await adapter.presignUpload({} as unknown as H3Event, {
             workspaceId,
             hash,
-            mimeType: 'image/png',
+            mimeType,
             sizeBytes: bytes.byteLength,
         });
 
-        const putRes = await fetch(presignUp.url, {
-            method: presignUp.method ?? 'PUT',
-            headers: presignUp.headers,
-            body: bytes,
-        });
-        expect(putRes.ok).toBe(true);
+        try {
+            if (bytes.byteLength > 0) {
+                const mutated = bytes.slice();
+                mutated[0] = mutated[0]! ^ 1;
+                const rejected = await fetch(presignUp.url, {
+                    method: 'PUT', headers: presignUp.headers, body: mutated,
+                });
+                expect(rejected.status).toBe(400);
+            }
+            const putRes = await fetch(presignUp.url, {
+                method: presignUp.method ?? 'PUT',
+                headers: presignUp.headers,
+                body: bytes,
+            });
+            expect(putRes.ok).toBe(true);
 
-        await adapter.commit({} as unknown as H3Event, {
-            workspace_id: workspaceId,
-            intent_id: presignUp.intentId,
-            hash,
-            storage_id: presignUp.storageId,
-            storage_provider_id: 's3',
-            mime_type: 'image/png',
-            size_bytes: bytes.byteLength,
-            name: 'integration.png',
-            kind: 'image',
-        });
+            await expect(adapter.presignDownload({} as H3Event, { workspaceId, hash }))
+                .rejects.toMatchObject({ statusCode: 404 });
+            const commitInput = {
+                workspace_id: workspaceId,
+                intent_id: presignUp.intentId,
+                hash,
+                storage_id: presignUp.storageId,
+                storage_provider_id: 's3',
+                mime_type: mimeType,
+                size_bytes: bytes.byteLength,
+                name: 'integration',
+                kind,
+            };
+            await adapter.commit({} as H3Event, commitInput);
+            // A bad commit payload must never erase an existing committed object.
+            await expect(adapter.commit({} as H3Event, { ...commitInput, size_bytes: bytes.byteLength + 1 }))
+                .rejects.toMatchObject({ statusCode: 400 });
+            await expect(adapter.deleteObject({} as H3Event, { workspaceId, hash }))
+                .rejects.toMatchObject({ statusCode: 503 });
+            expect(await adapter.gc({} as H3Event, { workspace_id: workspaceId, retention_seconds: 0 }))
+                .toMatchObject({ status: 'disabled', reason: 'deletion_coordination_required' });
 
-        const presignDown = await adapter.presignDownload({} as unknown as H3Event, {
-            workspaceId,
-            hash,
-        });
+            const presignDown = await adapter.presignDownload({} as unknown as H3Event, {
+                workspaceId,
+                hash,
+                mimeType,
+                disposition,
+                filename: 'integration',
+            });
 
-        const getRes = await fetch(presignDown.url, {
-            method: presignDown.method ?? 'GET',
-            headers: presignDown.headers,
-        });
-        expect(getRes.ok).toBe(true);
-        const downloaded = new Uint8Array(await getRes.arrayBuffer());
-        expect(sha256HashOf(downloaded)).toBe(hash);
+            const getRes = await fetch(presignDown.url, {
+                method: presignDown.method ?? 'GET',
+                headers: presignDown.headers,
+            });
+            expect(getRes.ok).toBe(true);
+            expect(getRes.headers.get('content-type')).toBe(kind === 'file' ? 'application/octet-stream' : mimeType);
+            expect(getRes.headers.get('content-disposition')).toContain(disposition);
+            const downloaded = new Uint8Array(await getRes.arrayBuffer());
+            expect(sha256HashOf(downloaded)).toBe(hash);
 
-        // Cleanup best-effort.
-        const objectKey = presignUp.storageId!;
-        await client
-            .send(
-                new DeleteObjectsCommand({
-                    Bucket: bucket,
-                    Delete: {
-                        Objects: [
-                            { Key: objectKey },
-                            { Key: `${objectKey}.meta.json` },
-                        ],
-                        Quiet: true,
-                    },
-                })
-            )
-            .catch(() => {});
+        } finally {
+            // Only the isolated test fixture is removed, including on failure.
+            const objectKey = presignUp.storageId!;
+            await client
+                .send(
+                    new DeleteObjectsCommand({
+                        Bucket: bucket,
+                        Delete: {
+                            Objects: [
+                                { Key: objectKey },
+                                { Key: `${objectKey}.meta.json` },
+                            ],
+                            Quiet: true,
+                        },
+                    })
+                );
+            client.destroy();
+        }
     });
 });

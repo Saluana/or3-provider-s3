@@ -1,18 +1,13 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { H3Event } from 'h3';
-import type {
-    CanonicalStorageQueryRequest,
-    CanonicalStorageQueryResponse,
-} from '~~/server/sync/gateway/types';
 import {
     HeadObjectCommand,
+    type HeadObjectCommandOutput,
     GetObjectCommand,
     PutObjectCommand,
     DeleteObjectCommand,
-    ListObjectsV2Command,
 } from '@aws-sdk/client-s3';
 import { S3StorageGatewayAdapter } from '../s3-storage-gateway-adapter';
-import { verifyStorageReferenceContract } from '~~/shared/testing/contracts/storage';
 
 const HASH = `sha256:${'a'.repeat(64)}`;
 const CHECKSUM = Buffer.from('a'.repeat(64), 'hex').toString('base64');
@@ -24,7 +19,7 @@ vi.mock('@aws-sdk/s3-request-presigner', () => ({
 }));
 
 function makeAdapter(overrides: Partial<ConstructorParameters<typeof S3StorageGatewayAdapter>[0]> = {}) {
-    const send = vi.fn(async (command: unknown) => {
+    const send = vi.fn(async (command: unknown): Promise<Partial<HeadObjectCommandOutput>> => {
         if (command instanceof HeadObjectCommand) {
             return {
                 ContentLength: 3,
@@ -216,27 +211,22 @@ describe('S3StorageGatewayAdapter', () => {
         expect(signedUrlMock).not.toHaveBeenCalled();
     });
 
-    it('deletes the derived blob and marker and remains idempotent on retry', async () => {
+    it('blocks deletion of an existing blob or marker without coordination', async () => {
         const { adapter, send } = makeAdapter();
-        const input = {
-            workspaceId: 'ws1',
-            hash: HASH,
-            storageId: `ws1/${HASH}`,
-        };
+        await expect(adapter.deleteObject({} as H3Event, {
+            workspaceId: 'ws1', hash: HASH, storageId: `ws1/${HASH}`,
+        })).rejects.toMatchObject({ statusCode: 503 });
+        expect(send.mock.calls.some(([command]) => command instanceof DeleteObjectCommand)).toBe(false);
+    });
 
-        await expect(adapter.deleteObject({} as H3Event, input)).resolves.toBeUndefined();
-        await expect(adapter.deleteObject({} as H3Event, input)).resolves.toBeUndefined();
-
-        const keys = send.mock.calls
-            .map(([command]) => command)
-            .filter((command) => command instanceof DeleteObjectCommand)
-            .map((command) => command.input.Key);
-        expect(keys).toEqual([
-            `ws1/${HASH}`,
-            `ws1/${HASH}.meta.json`,
-            `ws1/${HASH}`,
-            `ws1/${HASH}.meta.json`,
-        ]);
+    it('succeeds for an already absent blob and marker but propagates verification errors', async () => {
+        const { adapter, send } = makeAdapter();
+        send.mockRejectedValue(Object.assign(new Error('missing'), { name: 'NotFound' }));
+        await expect(adapter.deleteObject({} as H3Event, { workspaceId: 'ws1', hash: HASH }))
+            .resolves.toBeUndefined();
+        send.mockRejectedValue(Object.assign(new Error('denied'), { $metadata: { httpStatusCode: 403 } }));
+        await expect(adapter.deleteObject({} as H3Event, { workspaceId: 'ws1', hash: HASH }))
+            .rejects.toMatchObject({ statusCode: 502 });
     });
 
     it('rejects a mismatched delete storage_id before issuing an S3 command', async () => {
@@ -249,8 +239,16 @@ describe('S3StorageGatewayAdapter', () => {
         expect(send).not.toHaveBeenCalled();
     });
 
-    it('commit validates head and writes marker', async () => {
+    it('commit retrieves the stored checksum before writing the marker', async () => {
         const { adapter, send } = makeAdapter();
+        const originalSend = send.getMockImplementation()!;
+        send.mockImplementation(async (command: unknown) => {
+            const result = await originalSend(command);
+            if (command instanceof HeadObjectCommand && command.input.ChecksumMode !== 'ENABLED') {
+                return { ...result, ChecksumSHA256: undefined };
+            }
+            return result;
+        });
         await adapter.commit({} as H3Event, {
             workspace_id: 'ws1',
             intent_id: INTENT_ID,
@@ -267,7 +265,7 @@ describe('S3StorageGatewayAdapter', () => {
         expect(send).toHaveBeenCalledWith(expect.any(PutObjectCommand));
     });
 
-    it('commit rejects uploads missing content length and deletes blob best-effort', async () => {
+    it('commit rejects uploads missing content length without deleting the stored blob', async () => {
         const send = vi.fn(async (command: unknown) => {
             if (command instanceof HeadObjectCommand) {
                 return { ContentType: 'image/png', ETag: '"etag"' };
@@ -309,10 +307,10 @@ describe('S3StorageGatewayAdapter', () => {
             kind: 'image',
         })).rejects.toMatchObject({ statusCode: 400 });
 
-        expect(send).toHaveBeenCalledWith(expect.any(DeleteObjectCommand));
+        expect(send.mock.calls.some(([command]) => command instanceof DeleteObjectCommand)).toBe(false);
     });
 
-    it('commit rejects uploads missing content type and deletes blob best-effort', async () => {
+    it('commit rejects uploads missing content type without deleting the stored blob', async () => {
         const send = vi.fn(async (command: unknown) => {
             if (command instanceof HeadObjectCommand) {
                 return { ContentLength: 3, ETag: '"etag"' };
@@ -354,7 +352,7 @@ describe('S3StorageGatewayAdapter', () => {
             kind: 'image',
         })).rejects.toMatchObject({ statusCode: 400 });
 
-        expect(send).toHaveBeenCalledWith(expect.any(DeleteObjectCommand));
+        expect(send.mock.calls.some(([command]) => command instanceof DeleteObjectCommand)).toBe(false);
     });
 
     it('rejects expired intents and object checksum mutation before marker creation', async () => {
@@ -434,259 +432,23 @@ describe('S3StorageGatewayAdapter', () => {
         expect(consumeUploadIntent).toHaveBeenCalledTimes(1);
     });
 
-    it('gc fails closed without canonical storage capability and issues no S3 requests', async () => {
-        const send = vi.fn(async () => {
-            throw new Error('GC must not issue an S3 command');
-        });
-
-        const adapter = new S3StorageGatewayAdapter(
-            {
-                endpoint: undefined,
-                region: 'us-east-1',
-                bucket: 'bucket',
-                accessKeyId: 'ak',
-                secretAccessKey: 'sk',
-                sessionToken: undefined,
-                forcePathStyle: false,
-                keyPrefix: '',
-                urlTtlSeconds: 900,
-                requireChecksum: false,
-            },
-            {
-                client: { send },
-                now: () => 10_000,
-                getSyncGateway: () => undefined,
-            }
-        );
-
-        const result = await adapter.gc({} as H3Event, {
-            workspace_id: 'ws1',
-            retention_seconds: 1,
-            limit: 10,
-        });
-
-        expect(result).toEqual({
-            deleted_count: 0,
-            status: 'disabled',
-            reason: 'canonical_reference_state_required',
-        });
+    it.each([false, true])('gc is disabled even with canonical queries available=%s', async (canonicalAvailable) => {
+        const { adapter, send } = makeAdapter();
+        const queryCanonicalStorage = vi.fn(async () => ({ items: [], hasMore: false }));
+        const gcAdapter = new S3StorageGatewayAdapter({
+            region: 'us-east-1', bucket: 'bucket', accessKeyId: 'ak', secretAccessKey: 'sk',
+            forcePathStyle: false, keyPrefix: '', urlTtlSeconds: 900, requireChecksum: true,
+        }, { client: { send }, getSyncGateway: () => canonicalAvailable ? { queryCanonicalStorage } : undefined });
+        expect(await gcAdapter.gc({} as H3Event, {
+            workspace_id: 'ws1', retention_seconds: 1, limit: 10,
+        })).toEqual({ deleted_count: 0, status: 'disabled', reason: 'deletion_coordination_required' });
         expect(send).not.toHaveBeenCalled();
-    });
-
-    it('gc still validates its request before returning the disabled status', async () => {
-        const send = vi.fn();
-        const adapter = new S3StorageGatewayAdapter(
-            {
-                endpoint: undefined,
-                region: 'us-east-1',
-                bucket: 'bucket',
-                accessKeyId: 'ak',
-                secretAccessKey: 'sk',
-                sessionToken: undefined,
-                forcePathStyle: false,
-                keyPrefix: '',
-                urlTtlSeconds: 900,
-                requireChecksum: false,
-            },
-            { client: { send }, getSyncGateway: () => undefined }
-        );
-
+        expect(queryCanonicalStorage).not.toHaveBeenCalled();
         await expect(adapter.gc({} as H3Event, {
-            workspace_id: 'ws1',
-            retention_seconds: -1,
+            workspace_id: '../other', retention_seconds: 1,
         })).rejects.toMatchObject({ statusCode: 400 });
-        expect(send).not.toHaveBeenCalled();
-    });
-
-    function makeGcAdapter(input: {
-        listedKeys: string[][];
-        existingKeys: string[];
-        modifiedAt?: Record<string, Date>;
-        canonical?: (kind: string, hash: string) => boolean;
-    }) {
-        let listPage = 0;
-        const deletedKeys: string[] = [];
-        const old = new Date(1_000);
-        const send = vi.fn(async (command: unknown) => {
-            if (command instanceof ListObjectsV2Command) {
-                const keys = input.listedKeys[listPage] ?? [];
-                listPage += 1;
-                return {
-                    Contents: keys.map((Key) => ({ Key, LastModified: old })),
-                    IsTruncated: listPage < input.listedKeys.length,
-                    NextContinuationToken: listPage < input.listedKeys.length ? `page-${listPage}` : undefined,
-                };
-            }
-            if (command instanceof HeadObjectCommand) {
-                const key = command.input.Key as string;
-                if (!input.existingKeys.includes(key)) {
-                    throw Object.assign(new Error('missing'), { name: 'NotFound' });
-                }
-                return {
-                    LastModified: input.modifiedAt?.[key] ?? old,
-                    ContentLength: 3,
-                    ContentType: 'image/png',
-                };
-            }
-            if (command instanceof DeleteObjectCommand) {
-                deletedKeys.push(command.input.Key as string);
-                return {};
-            }
-            return {};
-        });
-        const queryCanonicalStorage = vi.fn(async (
-            _event: H3Event,
-            request: CanonicalStorageQueryRequest,
-        ): Promise<CanonicalStorageQueryResponse> => {
-            if (!input.canonical?.(request.kind, request.hash as string)) {
-                return { items: [], hasMore: false };
-            }
-            return request.kind === 'live_metadata'
-                ? {
-                    items: [{
-                        kind: 'metadata',
-                        hash: request.hash as string,
-                        sizeBytes: 3,
-                        updatedAt: 1,
-                    }],
-                    hasMore: false,
-                }
-                : {
-                    items: [{
-                        kind: 'reference',
-                        hash: request.hash as string,
-                        sourceTable: 'messages',
-                        sourceId: 'message-1',
-                    }],
-                    hasMore: false,
-                };
-        });
-        const adapter = new S3StorageGatewayAdapter(
-            {
-                endpoint: undefined,
-                region: 'us-east-1',
-                bucket: 'bucket',
-                accessKeyId: 'ak',
-                secretAccessKey: 'sk',
-                sessionToken: undefined,
-                forcePathStyle: false,
-                keyPrefix: '',
-                urlTtlSeconds: 900,
-                requireChecksum: false,
-            },
-            {
-                client: { send },
-                now: () => 100_000,
-                getSyncGateway: () => ({ queryCanonicalStorage }),
-            }
-        );
-        return { adapter, send, deletedKeys, queryCanonicalStorage };
-    }
-
-    it('does not delete an old blob when its newer marker is on a later listing page', async () => {
-        const objectKey = `ws1/${HASH}`;
-        const markerKey = `${objectKey}.meta.json`;
-        const { adapter, send, deletedKeys } = makeGcAdapter({
-            listedKeys: [[objectKey], [markerKey]],
-            existingKeys: [objectKey, markerKey],
-            modifiedAt: { [markerKey]: new Date(100_000) },
-        });
-
         await expect(adapter.gc({} as H3Event, {
-            workspace_id: 'ws1', retention_seconds: 1, limit: 1,
-        })).resolves.toEqual({ deleted_count: 0, scanned_count: 1, status: 'completed' });
-
-        expect(send.mock.calls.filter(([command]) => command instanceof ListObjectsV2Command)).toHaveLength(1);
-        expect(send).toHaveBeenCalledWith(expect.objectContaining({
-            input: expect.objectContaining({ Key: markerKey }),
-        }));
-        expect(deletedKeys).toEqual([]);
-    });
-
-    it('does not delete an old marker when its newer blob is on a later listing page', async () => {
-        const objectKey = `ws1/${HASH}`;
-        const markerKey = `${objectKey}.meta.json`;
-        const { adapter, send, deletedKeys } = makeGcAdapter({
-            listedKeys: [[markerKey], [objectKey]],
-            existingKeys: [objectKey, markerKey],
-            modifiedAt: { [objectKey]: new Date(100_000) },
-        });
-
-        await expect(adapter.gc({} as H3Event, {
-            workspace_id: 'ws1', retention_seconds: 1, limit: 1,
-        })).resolves.toMatchObject({ deleted_count: 0, scanned_count: 1 });
-
-        expect(send.mock.calls.filter(([command]) => command instanceof ListObjectsV2Command)).toHaveLength(1);
-        expect(send).toHaveBeenCalledWith(expect.objectContaining({
-            input: expect.objectContaining({ Key: objectKey }),
-        }));
-        expect(deletedKeys).toEqual([]);
-    });
-
-    it('deletes an unreferenced committed blob and marker together', async () => {
-        const objectKey = `ws1/${HASH}`;
-        const markerKey = `${objectKey}.meta.json`;
-        const { adapter, deletedKeys, queryCanonicalStorage } = makeGcAdapter({
-            listedKeys: [[objectKey, markerKey]],
-            existingKeys: [objectKey, markerKey],
-        });
-
-        await expect(adapter.gc({} as H3Event, {
-            workspace_id: 'ws1', retention_seconds: 1, limit: 10,
-        })).resolves.toEqual({ deleted_count: 1, scanned_count: 1, status: 'completed' });
-
-        expect(deletedKeys).toEqual([objectKey, markerKey]);
-        expect(queryCanonicalStorage).toHaveBeenCalledTimes(4);
-        for (const call of queryCanonicalStorage.mock.calls) {
-            expect(call[1]).toMatchObject({
-                scope: { workspaceId: 'ws1' },
-                hash: HASH,
-                limit: 100,
-            });
-        }
-    });
-
-    it('keeps a committed pair with a canonical reference edge', async () => {
-        const objectKey = `ws1/${HASH}`;
-        const markerKey = `${objectKey}.meta.json`;
-        const { adapter, deletedKeys } = makeGcAdapter({
-            listedKeys: [[objectKey, markerKey]],
-            existingKeys: [objectKey, markerKey],
-            canonical: (kind) => kind === 'reference_edges',
-        });
-
-        await adapter.gc({} as H3Event, {
-            workspace_id: 'ws1', retention_seconds: 1, limit: 10,
-        });
-        expect(deletedKeys).toEqual([]);
-    });
-
-    it('executes the shared canonical reference contract', async () => {
-        const references = new Set<string>();
-        const deleted: string[] = [];
-        await verifyStorageReferenceContract({
-            name: 's3',
-            async put() {},
-            async reference(hash) { references.add(hash); },
-            async collect() {
-                for (const hash of [HASH, `sha256:${'b'.repeat(64)}`]) {
-                    const objectKey = `ws1/${hash}`;
-                    const markerKey = `${objectKey}.meta.json`;
-                    const harness = makeGcAdapter({
-                        listedKeys: [[objectKey, markerKey]],
-                        existingKeys: [objectKey, markerKey],
-                        canonical: (kind, candidate) =>
-                            kind === 'reference_edges' && references.has(
-                                candidate === HASH ? 'live' : 'orphan'
-                            ),
-                    });
-                    await harness.adapter.gc({} as H3Event, {
-                        workspace_id: 'ws1', retention_seconds: 1, limit: 10,
-                    });
-                    if (harness.deletedKeys.length > 0) deleted.push(hash === HASH ? 'live' : 'orphan');
-                }
-                return deleted;
-            },
-        });
+            workspace_id: 'ws1', retention_seconds: -1,
+        })).rejects.toMatchObject({ statusCode: 400 });
     });
 });

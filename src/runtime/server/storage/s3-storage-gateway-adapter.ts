@@ -5,8 +5,6 @@ import {
     PutObjectCommand,
     GetObjectCommand,
     HeadObjectCommand,
-    DeleteObjectCommand,
-    ListObjectsV2Command,
     type S3ClientConfig,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
@@ -19,9 +17,9 @@ import type {
     PresignDownloadResponse,
     DeleteObjectRequest,
 } from '~~/server/storage/gateway/types';
-import type { CanonicalStorageQueryKind, SyncGatewayAdapter } from '~~/server/sync/gateway/types';
+import type { SyncGatewayAdapter } from '~~/server/sync/gateway/types';
 import { getActiveSyncGatewayAdapter } from '~~/server/sync/gateway/registry';
-import { buildS3MarkerKey, buildS3ObjectKey, sha256HexToBase64Checksum } from './s3-keys';
+import { assertValidWorkspaceId, buildS3MarkerKey, buildS3ObjectKey, sha256HexToBase64Checksum } from './s3-keys';
 import { validateS3StorageConfig } from './s3-config';
 import { randomUUID } from 'node:crypto';
 
@@ -99,8 +97,10 @@ function parseCommitInput(input: unknown): CommitInput {
 
 function parseGcInput(input: unknown): GcInput {
     const obj = assertObject(input, 'Invalid gc payload');
+    const workspaceId = assertString(obj.workspace_id, 'Invalid workspace_id');
+    assertValidWorkspaceId(workspaceId);
     return {
-        workspace_id: assertString(obj.workspace_id, 'Invalid workspace_id'),
+        workspace_id: workspaceId,
         retention_seconds: assertInt(obj.retention_seconds, 'Invalid retention_seconds', { min: 0 }) as number,
         limit: assertInt(obj.limit, 'Invalid limit', { min: 1, optional: true }),
     };
@@ -153,10 +153,6 @@ function resolveDownloadHeaders(input: PresignDownloadRequest): {
 }
 
 const MAX_UPLOAD_SIZE_BYTES = 100 * 1024 * 1024;
-const MAX_GC_CANDIDATES = 500;
-const MAX_GC_LIST_PAGES = 10;
-const CANONICAL_QUERY_PAGE_SIZE = 100;
-const MAX_CANONICAL_QUERY_PAGES = 10;
 
 function isNotFoundError(error: unknown): boolean {
     const e = error as { name?: string; $metadata?: { httpStatusCode?: number } };
@@ -376,6 +372,7 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
                 new HeadObjectCommand({
                     Bucket: this.cfg.bucket,
                     Key: derivedKey,
+                    ChecksumMode: 'ENABLED',
                 })
             );
         } catch (error) {
@@ -386,27 +383,20 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
         }
 
         const expectedSize = body.size_bytes;
-        const deleteUploadedObject = () => this.clientInstance.send(
-            new DeleteObjectCommand({ Bucket: this.cfg.bucket, Key: derivedKey })
-        ).catch(() => {});
 
         if (typeof head.ContentLength !== 'number') {
-            await deleteUploadedObject();
             throw createError({ statusCode: 400, statusMessage: 'Uploaded object missing content length' });
         }
         if (head.ContentLength !== expectedSize) {
-            await deleteUploadedObject();
             throw createError({ statusCode: 400, statusMessage: 'Uploaded object size mismatch' });
         }
 
         const expectedMime = normalizeMime(body.mime_type);
         if (!head.ContentType) {
-            await deleteUploadedObject();
             throw createError({ statusCode: 400, statusMessage: 'Uploaded object missing content type' });
         }
         const actualMime = normalizeMime(head.ContentType);
         if (actualMime !== expectedMime) {
-            await deleteUploadedObject();
             throw createError({ statusCode: 400, statusMessage: 'Uploaded object content-type mismatch' });
         }
         const metadata = head.Metadata ?? {};
@@ -483,186 +473,28 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
             });
         }
 
-        // S3 DeleteObject is idempotent. Delete both the blob and its commit
-        // marker so retries also heal a partially completed prior attempt.
-        await this.clientInstance.send(new DeleteObjectCommand({
-            Bucket: this.cfg.bucket,
-            Key: objectKey,
+        // A query against a separate database cannot prevent a concurrent
+        // metadata restore or reference write while an S3 object is deleted.
+        const present = await Promise.all([objectKey, buildS3MarkerKey(objectKey)].map(async (key) => {
+            try {
+                await this.clientInstance.send(new HeadObjectCommand({ Bucket: this.cfg.bucket, Key: key }));
+                return true;
+            } catch (error) {
+                if (isNotFoundError(error)) return false;
+                throw createError({ statusCode: 502, statusMessage: 'S3 object verification failed' });
+            }
         }));
-        await this.clientInstance.send(new DeleteObjectCommand({
-            Bucket: this.cfg.bucket,
-            Key: buildS3MarkerKey(objectKey),
-        }));
+        if (!present.some(Boolean)) return;
+        throw createError({ statusCode: 503, statusMessage: 'Provider-owned deletion coordination is required' });
     }
 
-    async gc(
-        event: H3Event,
-        input: unknown,
-    ): Promise<{
+    async gc(_event: H3Event, input: unknown): Promise<{
         deleted_count: number;
-        scanned_count?: number;
-        status: 'completed' | 'disabled';
-        reason?: 'canonical_reference_state_required';
+        status: 'disabled';
+        reason: 'deletion_coordination_required';
     }> {
-        const body = parseGcInput(input);
-        const sync = this.getSyncGatewayFn();
-        if (!sync?.queryCanonicalStorage) {
-            return {
-                deleted_count: 0,
-                status: 'disabled',
-                reason: 'canonical_reference_state_required',
-            };
-        }
-
-        const candidateLimit = Math.min(body.limit ?? 100, MAX_GC_CANDIDATES);
-        const workspacePrefix = `${this.cfg.keyPrefix}${body.workspace_id}/`;
-        const markerSuffix = '.meta.json';
-        const candidates = new Map<string, { hash: string; objectKey: string; markerKey: string }>();
-        let continuationToken: string | undefined;
-        let listPageCount = 0;
-
-        do {
-            const page = await this.clientInstance.send(new ListObjectsV2Command({
-                Bucket: this.cfg.bucket,
-                Prefix: workspacePrefix,
-                ContinuationToken: continuationToken,
-                MaxKeys: Math.min(Math.max(candidateLimit * 2, 10), 1000),
-            }));
-            listPageCount += 1;
-
-            for (const object of page.Contents ?? []) {
-                const key = object.Key;
-                if (!key?.startsWith(workspacePrefix)) continue;
-                const relativeKey = key.slice(workspacePrefix.length);
-                const hash = relativeKey.endsWith(markerSuffix)
-                    ? relativeKey.slice(0, -markerSuffix.length)
-                    : relativeKey;
-                if (!/^sha256:[0-9a-f]{64}$/i.test(hash) || candidates.has(hash)) continue;
-                const objectKey = buildS3ObjectKey({
-                    keyPrefix: this.cfg.keyPrefix,
-                    workspaceId: body.workspace_id,
-                    hash,
-                });
-                candidates.set(hash, {
-                    hash,
-                    objectKey,
-                    markerKey: buildS3MarkerKey(objectKey),
-                });
-                if (candidates.size >= candidateLimit) break;
-            }
-
-            continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
-            if (page.IsTruncated && !continuationToken) {
-                throw createError({ statusCode: 502, statusMessage: 'S3 listing returned an invalid page' });
-            }
-        } while (
-            continuationToken
-            && candidates.size < candidateLimit
-            && listPageCount < MAX_GC_LIST_PAGES
-        );
-
-        const hasCanonicalRecord = async (
-            kind: Extract<CanonicalStorageQueryKind, 'live_metadata' | 'reference_edges'>,
-            hash: string,
-        ): Promise<boolean> => {
-            let cursor: string | undefined;
-            let pageCount = 0;
-            do {
-                const page = await sync.queryCanonicalStorage!(event, {
-                    scope: { workspaceId: body.workspace_id },
-                    kind,
-                    hash,
-                    cursor,
-                    limit: CANONICAL_QUERY_PAGE_SIZE,
-                });
-                pageCount += 1;
-                if (page.items.length > 0) return true;
-                if (page.hasMore && !page.nextCursor) {
-                    throw createError({
-                        statusCode: 502,
-                        statusMessage: 'Canonical storage provider returned an invalid page',
-                    });
-                }
-                if (page.hasMore && pageCount >= MAX_CANONICAL_QUERY_PAGES) {
-                    throw createError({
-                        statusCode: 502,
-                        statusMessage: 'Canonical storage query exceeded the garbage-collection page bound',
-                    });
-                }
-                cursor = page.nextCursor;
-            } while (cursor);
-            return false;
-        };
-
-        type HeadState = { exists: boolean; lastModifiedMs?: number };
-        const headObject = async (key: string): Promise<HeadState> => {
-            try {
-                const head = await this.clientInstance.send(new HeadObjectCommand({
-                    Bucket: this.cfg.bucket,
-                    Key: key,
-                }));
-                return {
-                    exists: true,
-                    lastModifiedMs: head.LastModified?.getTime(),
-                };
-            } catch (error) {
-                if (isNotFoundError(error)) return { exists: false };
-                throw createError({ statusCode: 502, statusMessage: 'S3 HEAD failed during garbage collection' });
-            }
-        };
-
-        const cutoffMs = this.now() - body.retention_seconds * 1000;
-        const collectible: Array<{
-            candidate: { hash: string; objectKey: string; markerKey: string };
-            blob: HeadState;
-            marker: HeadState;
-        }> = [];
-
-        // HEAD both sides of every pair. Listing order or an unseen later page
-        // is never treated as evidence that a counterpart is absent.
-        for (const candidate of candidates.values()) {
-            const [blob, marker] = await Promise.all([
-                headObject(candidate.objectKey),
-                headObject(candidate.markerKey),
-            ]);
-            const existing = [blob, marker].filter((state) => state.exists);
-            if (existing.length === 0) continue;
-            // Missing/invalid LastModified is not proof that retention elapsed.
-            if (existing.some((state) => state.lastModifiedMs === undefined || state.lastModifiedMs > cutoffMs)) {
-                continue;
-            }
-            if (await hasCanonicalRecord('live_metadata', candidate.hash)) continue;
-            if (await hasCanonicalRecord('reference_edges', candidate.hash)) continue;
-            collectible.push({ candidate, blob, marker });
-        }
-
-        let deletedCount = 0;
-        for (const entry of collectible) {
-            // Close the mark/sweep race: newly committed metadata or a new
-            // reference wins immediately before either object is removed.
-            if (await hasCanonicalRecord('live_metadata', entry.candidate.hash)) continue;
-            if (await hasCanonicalRecord('reference_edges', entry.candidate.hash)) continue;
-
-            if (entry.blob.exists) {
-                await this.clientInstance.send(new DeleteObjectCommand({
-                    Bucket: this.cfg.bucket,
-                    Key: entry.candidate.objectKey,
-                }));
-            }
-            if (entry.marker.exists) {
-                await this.clientInstance.send(new DeleteObjectCommand({
-                    Bucket: this.cfg.bucket,
-                    Key: entry.candidate.markerKey,
-                }));
-            }
-            deletedCount += 1;
-        }
-
-        return {
-            deleted_count: deletedCount,
-            scanned_count: candidates.size,
-            status: 'completed',
-        };
+        parseGcInput(input);
+        return { deleted_count: 0, status: 'disabled', reason: 'deletion_coordination_required' };
     }
 }
 
