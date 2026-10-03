@@ -71,13 +71,15 @@ jobs:
       - run: bun run type-check
       - run: bun run type-check:standalone
       - run: bun run test
+      - name: Build pinned MinIO test fixture
+        run: docker build --file .github/fixtures/minio.Dockerfile --tag or3-s3-ci-fixture .github/fixtures
       - name: Start disposable S3 compatibility server
         run: |
           set -euo pipefail
           docker run -d --name or3-s3-ci -p 127.0.0.1:19091:9000 \
             -e MINIO_ROOT_USER=or3-local-test \
             -e MINIO_ROOT_PASSWORD=or3-disposable-test-secret \
-            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
+            or3-s3-ci-fixture server /data
           for attempt in {1..20}; do
             if curl --fail --silent http://127.0.0.1:19091/minio/health/ready; then exit 0; fi
             sleep 1
