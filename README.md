@@ -180,6 +180,18 @@ and uploads a JSON test report. The suite verifies image/PDF/generic and zero-by
 round trips, pending-download denial, safe response headers, failed-commit blob
 preservation, and disabled destructive deletion/GC.
 
+The CI fixture builds official [MinIO RELEASE.2025-10-15T17-29-55Z](https://github.com/minio/minio/releases/tag/RELEASE.2025-10-15T17-29-55Z)
+from commit `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a` using the digest-pinned
+[Docker Official Go image](https://hub.docker.com/_/golang) in
+`.github/fixtures/minio.Dockerfile`. MinIO now distributes its community edition
+as source only, and the former `minio/minio` image is no longer publicly pullable.
+The build keeps the Go toolchain fixed and verifies module downloads through Go's
+checksum database. To build the same disposable fixture locally:
+
+```bash
+docker build --file .github/fixtures/minio.Dockerfile --tag or3-s3-ci-fixture .github/fixtures
+```
+
 To repeat it against your chosen host, configure `OR3_STORAGE_S3_*` for an existing
 **disposable test bucket** (including endpoint, path style, and optional key prefix), then run:
 
