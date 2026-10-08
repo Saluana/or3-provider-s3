@@ -161,9 +161,9 @@ jobs:
           name="$(node -e 'console.log(require(process.argv[1]).name)' "$package_json")"
           version="$(node -e 'console.log(require(process.argv[1]).version)' "$package_json")"
           # npm accepts provenance-backed uploads before its read API serves them.
-          # Prior releases exceeded 40s; always refresh cached registry responses.
-          for attempt in {1..36}; do
-            if [[ "$(npm view "$name@$version" version --prefer-online 2>/dev/null || true)" == "$version" ]]; then exit 0; fi
+          # 0.0.10 propagated just after 3m; use a fresh cache and bounded 10m window.
+          for attempt in {1..120}; do
+            if [[ "$(npm view "$name@$version" version --prefer-online --cache "$RUNNER_TEMP/npm-readback" 2>/dev/null || true)" == "$version" ]]; then exit 0; fi
             sleep 5
           done
           echo "Timed out waiting for $name@$version to become visible on npm." >&2
