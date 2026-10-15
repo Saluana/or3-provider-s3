@@ -49,7 +49,11 @@ function parseUrlOrUndefined(value: string | undefined): string | undefined {
     const trimmed = (value ?? '').trim();
     if (!trimmed) return undefined;
     try {
-        new URL(trimmed);
+        const endpoint = new URL(trimmed);
+        if (!['https:', 'http:'].includes(endpoint.protocol) ||
+            endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+            return undefined;
+        }
         return trimmed;
     } catch {
         return undefined;
@@ -125,7 +129,7 @@ export function validateS3StorageConfig(
     }
 
     if (String(process.env.OR3_STORAGE_S3_ENDPOINT ?? '').trim() && !endpoint) {
-        errors.push('OR3_STORAGE_S3_ENDPOINT must be a valid URL.');
+        errors.push('OR3_STORAGE_S3_ENDPOINT must be an HTTP(S) URL without credentials, query, or fragment.');
     }
 
     if (isHttpUrl(endpoint) && process.env[ALLOW_INSECURE_HTTP_ENV] !== 'true') {

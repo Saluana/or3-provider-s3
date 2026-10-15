@@ -19,7 +19,7 @@ import type {
 } from '~~/server/storage/gateway/types';
 import type { SyncGatewayAdapter } from '~~/server/sync/gateway/types';
 import { getActiveSyncGatewayAdapter } from '~~/server/sync/gateway/registry';
-import { assertValidWorkspaceId, buildS3MarkerKey, buildS3ObjectKey, sha256HexToBase64Checksum } from './s3-keys';
+import { assertValidWorkspaceId, buildS3MarkerKey, buildS3ObjectKey, requireSha256Hash, sha256HexToBase64Checksum } from './s3-keys';
 import { validateS3StorageConfig } from './s3-config';
 import { randomUUID } from 'node:crypto';
 
@@ -82,7 +82,7 @@ function parseCommitInput(input: unknown): CommitInput {
     return {
         workspace_id: assertString(obj.workspace_id, 'Invalid workspace_id'),
         intent_id: assertString(obj.intent_id, 'Invalid intent_id'),
-        hash: assertString(obj.hash, 'Invalid hash'),
+        hash: requireSha256Hash(assertString(obj.hash, 'Invalid hash')),
         storage_id: assertString(obj.storage_id, 'Invalid storage_id'),
         storage_provider_id: assertString(obj.storage_provider_id, 'Invalid storage_provider_id'),
         mime_type: assertString(obj.mime_type, 'Invalid mime_type'),
@@ -228,17 +228,20 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
         if (input.sizeBytes > MAX_UPLOAD_SIZE_BYTES) {
             throw createError({ statusCode: 413, statusMessage: `Upload exceeds ${MAX_UPLOAD_SIZE_BYTES} byte limit` });
         }
+        const hash = requireSha256Hash(input.hash);
         const key = buildS3ObjectKey({
             keyPrefix: this.cfg.keyPrefix,
             workspaceId: input.workspaceId,
-            hash: input.hash,
+            hash,
         });
 
         const expiresIn = expiresInMsToSeconds(input.expiresInMs, this.cfg.urlTtlSeconds);
         const intentId = this.randomIdFn();
         const expiresAt = this.now() + expiresIn * 1000;
         const sync = this.getSyncGatewayFn();
-        if (input.workspaceQuotaBytes !== undefined && !sync?.reserveUploadIntent) {
+        const supportsIntents = Boolean(sync?.reserveUploadIntent && sync.consumeUploadIntent);
+        if (!supportsIntents && (input.workspaceQuotaBytes !== undefined ||
+            sync?.reserveUploadIntent || sync?.consumeUploadIntent)) {
             throw createError({
                 statusCode: 503,
                 statusMessage: 'Atomic upload quota reservations require sync-provider support',
@@ -248,7 +251,7 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
             await sync.reserveUploadIntent(event, {
                 intentId,
                 workspaceId: input.workspaceId,
-                hash: input.hash,
+                hash,
                 mimeType: normalizeMime(input.mimeType),
                 sizeBytes: input.sizeBytes,
                 expiresAt: Math.floor(expiresAt / 1000),
@@ -261,9 +264,9 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
             Key: key,
             ContentType: input.mimeType,
             ContentLength: input.sizeBytes,
-            ChecksumSHA256: sha256HexToBase64Checksum(input.hash),
+            ChecksumSHA256: sha256HexToBase64Checksum(hash),
             Metadata: {
-                'or3-hash': input.hash,
+                'or3-hash': hash,
                 'or3-workspace': input.workspaceId,
                 'or3-intent': intentId,
                 'or3-intent-expires': String(expiresAt),
@@ -286,7 +289,7 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
         const headers: Record<string, string> = {
             'Content-Type': input.mimeType,
             'Content-Length': String(input.sizeBytes),
-            'x-amz-checksum-sha256': sha256HexToBase64Checksum(input.hash),
+            'x-amz-checksum-sha256': sha256HexToBase64Checksum(hash),
         };
 
         return {
@@ -366,6 +369,12 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
             throw createError({ statusCode: 400, statusMessage: 'storage_id does not match expected object key' });
         }
 
+        const sync = this.getSyncGatewayFn();
+        const supportsIntents = Boolean(sync?.reserveUploadIntent && sync.consumeUploadIntent);
+        if (!supportsIntents && (sync?.reserveUploadIntent || sync?.consumeUploadIntent)) {
+            throw createError({ statusCode: 503, statusMessage: 'Upload intent consumption requires sync-provider support' });
+        }
+
         let head;
         try {
             head = await this.clientInstance.send(
@@ -406,12 +415,28 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
             throw createError({ statusCode: 400, statusMessage: 'Uploaded object does not match upload intent' });
         }
         const intentExpiresAt = Number(metadata['or3-intent-expires']);
-        if (!Number.isFinite(intentExpiresAt) || intentExpiresAt <= this.now()) {
+        // A paired sync provider distinguishes expired active reservations
+        // from exact consumed receipts, which must survive publication retries.
+        if (!Number.isFinite(intentExpiresAt) || (!supportsIntents && intentExpiresAt <= this.now())) {
             throw createError({ statusCode: 410, statusMessage: 'Upload intent expired' });
         }
         const expectedChecksum = sha256HexToBase64Checksum(body.hash);
         if (head.ChecksumSHA256 !== expectedChecksum) {
             throw createError({ statusCode: 400, statusMessage: 'Uploaded object checksum mismatch' });
+        }
+
+        // The sync provider stores an exact replay receipt. Consume before
+        // publishing a marker so a rejected reservation cannot expose a blob;
+        // a failed marker write can safely retry the same consumption.
+        if (sync?.consumeUploadIntent) {
+            await sync.consumeUploadIntent(event, {
+                intentId: body.intent_id,
+                workspaceId: body.workspace_id,
+                hash: body.hash,
+                mimeType: expectedMime,
+                sizeBytes: body.size_bytes,
+                storageId: body.storage_id,
+            });
         }
 
         const markerKey = buildS3MarkerKey(derivedKey);
@@ -442,21 +467,31 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
             );
         } catch (error) {
             const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
-            if (status === 409 || status === 412) {
-                throw createError({ statusCode: 409, statusMessage: 'Upload intent already consumed' });
+            if (status !== 409 && status !== 412) {
+                throw createError({ statusCode: 502, statusMessage: 'S3 commit marker write failed' });
             }
-            throw createError({ statusCode: 502, statusMessage: 'S3 commit marker write failed' });
-        }
-        const sync = this.getSyncGatewayFn();
-        if (sync?.consumeUploadIntent) {
-            await sync.consumeUploadIntent(event, {
-                intentId: body.intent_id,
-                workspaceId: body.workspace_id,
-                hash: body.hash,
-                mimeType: expectedMime,
-                sizeBytes: body.size_bytes,
-                storageId: body.storage_id,
-            });
+            let markerBody: string | undefined;
+            try {
+                const marker = await this.clientInstance.send(new GetObjectCommand({
+                    Bucket: this.cfg.bucket,
+                    Key: markerKey,
+                }));
+                markerBody = await marker.Body?.transformToString();
+            } catch (readError) {
+                if (!isNotFoundError(readError)) {
+                    throw createError({ statusCode: 502, statusMessage: 'S3 commit marker verification failed' });
+                }
+            }
+            let marker: Record<string, unknown> | undefined;
+            try {
+                marker = JSON.parse(markerBody ?? '') as Record<string, unknown>;
+            } catch { /* An invalid marker cannot prove a previous matching commit. */ }
+            if (!marker || marker.workspace_id !== body.workspace_id ||
+                marker.hash !== body.hash || marker.storage_id !== body.storage_id ||
+                marker.size_bytes !== body.size_bytes || typeof marker.mime_type !== 'string' ||
+                normalizeMime(marker.mime_type) !== expectedMime) {
+                throw createError({ statusCode: 409, statusMessage: 'Committed object metadata does not match upload' });
+            }
         }
     }
 

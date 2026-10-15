@@ -3,9 +3,11 @@ import { createHash } from 'node:crypto';
 import type { H3Event } from 'h3';
 import {
     DeleteObjectsCommand,
+    PutObjectCommand,
     S3Client,
 } from '@aws-sdk/client-s3';
 import { S3StorageGatewayAdapter } from '../s3-storage-gateway-adapter';
+import type { UploadIntentReservationRequest } from '~~/server/sync/gateway/types';
 
 /**
  * Optional compatibility test suite.
@@ -43,10 +45,10 @@ const describeMinioIntegration = process.env.OR3_S3_INTEGRATION_TESTS === 'true'
 
 describeMinioIntegration('minio integration (opt-in)', () => {
     it.each([
-        { mimeType: 'image/png', kind: 'image' as const, content: 'or3-s3-image', disposition: 'inline' },
-        { mimeType: 'application/pdf', kind: 'pdf' as const, content: 'or3-s3-pdf', disposition: 'inline' },
-        { mimeType: 'text/plain', kind: 'file' as const, content: '', disposition: 'attachment' },
-    ])('presign → PUT → commit → GET roundtrip for $mimeType', async ({ mimeType, kind, content, disposition }) => {
+        { mimeType: 'image/png', kind: 'image' as const, content: 'or3-s3-image', disposition: 'inline', hashForm: 'uppercase' },
+        { mimeType: 'application/pdf', kind: 'pdf' as const, content: 'or3-s3-pdf', disposition: 'inline', hashForm: 'bare' },
+        { mimeType: 'text/plain', kind: 'file' as const, content: '', disposition: 'attachment', hashForm: 'canonical' },
+    ])('presign → PUT → commit → canonical GET for $mimeType ($hashForm hash)', async ({ mimeType, kind, content, disposition, hashForm }) => {
         const endpoint = maybeEnv('OR3_STORAGE_S3_ENDPOINT');
         const region = envOrThrow('OR3_STORAGE_S3_REGION');
         const bucket = envOrThrow('OR3_STORAGE_S3_BUCKET');
@@ -64,6 +66,18 @@ describeMinioIntegration('minio integration (opt-in)', () => {
                 sessionToken,
             },
         });
+        let failMarkerWrite = false;
+        client.middlewareStack.add((next, context) => async (args) => {
+            if (failMarkerWrite && context.commandName === 'PutObjectCommand' &&
+                (args.input as { Key?: string }).Key?.endsWith('.meta.json')) {
+                failMarkerWrite = false;
+                throw new Error('Simulated transient marker write failure');
+            }
+            return next(args);
+        }, { step: 'initialize' });
+        let failConsumption = kind === 'image';
+        let now = Date.now();
+        const reservations = new Map<string, UploadIntentReservationRequest & { storageId?: string }>();
 
         const adapter = new S3StorageGatewayAdapter(
             {
@@ -78,15 +92,42 @@ describeMinioIntegration('minio integration (opt-in)', () => {
                 urlTtlSeconds: 60,
                 requireChecksum: true,
             },
-            { client, getSyncGateway: () => undefined }
+            {
+                client,
+                now: () => now,
+                getSyncGateway: () => ({
+                    async reserveUploadIntent(_event, input) {
+                        reservations.set(input.intentId, { ...input });
+                    },
+                    async consumeUploadIntent(_event, input) {
+                        const reservation = reservations.get(input.intentId);
+                        if (!reservation || reservation.workspaceId !== input.workspaceId ||
+                            reservation.hash !== input.hash || reservation.mimeType !== input.mimeType ||
+                            reservation.sizeBytes !== input.sizeBytes ||
+                            (reservation.storageId !== undefined && reservation.storageId !== input.storageId)) {
+                            throw Object.assign(new Error('Upload intent mismatched'), { statusCode: 409 });
+                        }
+                        if (reservation.expiresAt <= Math.floor(now / 1000)) {
+                            throw Object.assign(new Error('Upload intent expired'), { statusCode: 409 });
+                        }
+                        if (failConsumption) {
+                            failConsumption = false;
+                            throw Object.assign(new Error('Temporary sync failure'), { statusCode: 503 });
+                        }
+                        reservation.storageId = input.storageId;
+                    },
+                }),
+            }
         );
 
         // The provider validates the hash, size and MIME, not the file format.
         const bytes = new TextEncoder().encode(content);
-        const hash = sha256HashOf(bytes);
+        const canonicalHash = sha256HashOf(bytes);
+        const hash = hashForm === 'uppercase' ? canonicalHash.toUpperCase()
+            : hashForm === 'bare' ? canonicalHash.slice('sha256:'.length) : canonicalHash;
         const workspaceId = `ws_s3_test_${crypto.randomUUID().replaceAll('-', '')}`;
 
-        const presignUp = await adapter.presignUpload({} as unknown as H3Event, {
+        let presignUp = await adapter.presignUpload({} as unknown as H3Event, {
             workspaceId,
             hash,
             mimeType,
@@ -122,7 +163,56 @@ describeMinioIntegration('minio integration (opt-in)', () => {
                 name: 'integration',
                 kind,
             };
-            await adapter.commit({} as H3Event, commitInput);
+            if (kind === 'image') {
+                // An expired active reservation cannot publish a marker.
+                now = presignUp.expiresAt! + 1;
+                await expect(adapter.commit({} as H3Event, commitInput))
+                    .rejects.toMatchObject({ statusCode: 409 });
+                await expect(adapter.presignDownload({} as H3Event, { workspaceId, hash: canonicalHash }))
+                    .rejects.toMatchObject({ statusCode: 404 });
+                now = Date.now();
+                presignUp = await adapter.presignUpload({} as H3Event, {
+                    workspaceId, hash, mimeType, sizeBytes: bytes.byteLength,
+                });
+                expect((await fetch(presignUp.url, {
+                    method: 'PUT', headers: presignUp.headers, body: bytes,
+                })).ok).toBe(true);
+                commitInput.intent_id = presignUp.intentId;
+                await expect(adapter.commit({} as H3Event, commitInput))
+                    .rejects.toMatchObject({ statusCode: 503 });
+                await expect(adapter.presignDownload({} as H3Event, { workspaceId, hash: canonicalHash }))
+                    .rejects.toMatchObject({ statusCode: 404 });
+                failMarkerWrite = true;
+                await expect(adapter.commit({} as H3Event, commitInput))
+                    .rejects.toMatchObject({ statusCode: 502 });
+                await expect(adapter.presignDownload({} as H3Event, { workspaceId, hash: canonicalHash }))
+                    .rejects.toMatchObject({ statusCode: 404 });
+                // An expired consumed receipt cannot create an uncharged commit.
+                now = presignUp.expiresAt! + 1;
+                await expect(adapter.commit({} as H3Event, commitInput))
+                    .rejects.toMatchObject({ statusCode: 409 });
+                await expect(adapter.presignDownload({} as H3Event, { workspaceId, hash: canonicalHash }))
+                    .rejects.toMatchObject({ statusCode: 404 });
+                presignUp = await adapter.presignUpload({} as H3Event, {
+                    workspaceId, hash, mimeType, sizeBytes: bytes.byteLength,
+                });
+                expect((await fetch(presignUp.url, {
+                    method: 'PUT', headers: presignUp.headers, body: bytes,
+                })).ok).toBe(true);
+                commitInput.intent_id = presignUp.intentId;
+            }
+            if (kind === 'pdf') {
+                failMarkerWrite = true;
+                await expect(adapter.commit({} as H3Event, commitInput))
+                    .rejects.toMatchObject({ statusCode: 502 });
+                await expect(adapter.presignDownload({} as H3Event, { workspaceId, hash: canonicalHash }))
+                    .rejects.toMatchObject({ statusCode: 404 });
+            }
+            await Promise.all([
+                adapter.commit({} as H3Event, commitInput),
+                adapter.commit({} as H3Event, commitInput),
+            ]);
+            now = Date.now();
             // A bad commit payload must never erase an existing committed object.
             await expect(adapter.commit({} as H3Event, { ...commitInput, size_bytes: bytes.byteLength + 1 }))
                 .rejects.toMatchObject({ statusCode: 400 });
@@ -133,7 +223,7 @@ describeMinioIntegration('minio integration (opt-in)', () => {
 
             const presignDown = await adapter.presignDownload({} as unknown as H3Event, {
                 workspaceId,
-                hash,
+                hash: canonicalHash,
                 mimeType,
                 disposition,
                 filename: 'integration',
@@ -147,7 +237,28 @@ describeMinioIntegration('minio integration (opt-in)', () => {
             expect(getRes.headers.get('content-type')).toBe(kind === 'file' ? 'application/octet-stream' : mimeType);
             expect(getRes.headers.get('content-disposition')).toContain(disposition);
             const downloaded = new Uint8Array(await getRes.arrayBuffer());
-            expect(sha256HashOf(downloaded)).toBe(hash);
+            expect(sha256HashOf(downloaded)).toBe(canonicalHash);
+
+            if (kind === 'image') {
+                const repeatedUpload = await adapter.presignUpload({} as H3Event, {
+                    workspaceId, hash: canonicalHash, mimeType, sizeBytes: bytes.byteLength,
+                });
+                const repeatedPut = await fetch(repeatedUpload.url, {
+                    method: 'PUT', headers: repeatedUpload.headers, body: bytes,
+                });
+                expect(repeatedPut.ok).toBe(true);
+                const repeatedCommit = { ...commitInput, hash: canonicalHash, intent_id: repeatedUpload.intentId };
+                await adapter.commit({} as H3Event, repeatedCommit);
+
+                // A conflicting marker must not authorize a different object scope.
+                await client.send(new PutObjectCommand({
+                    Bucket: bucket, Key: `${presignUp.storageId}.meta.json`,
+                    Body: JSON.stringify({ workspace_id: 'other-workspace' }),
+                    ContentType: 'application/json',
+                }));
+                await expect(adapter.commit({} as H3Event, repeatedCommit))
+                    .rejects.toMatchObject({ statusCode: 409 });
+            }
 
         } finally {
             // Only the isolated test fixture is removed, including on failure.

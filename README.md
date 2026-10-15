@@ -58,7 +58,7 @@ The adapter only registers when the host app has auth and storage enabled and th
 | `OR3_STORAGE_S3_BUCKET` | **Yes** | — | S3 bucket name |
 | `OR3_STORAGE_S3_ACCESS_KEY_ID` | **Yes** | — | Access key ID (server-only) |
 | `OR3_STORAGE_S3_SECRET_ACCESS_KEY` | **Yes** | — | Secret access key (server-only) |
-| `OR3_STORAGE_S3_ENDPOINT` | No | AWS default | Custom endpoint URL (R2, MinIO, B2). Must be HTTPS unless `OR3_STORAGE_S3_ALLOW_INSECURE_HTTP=true` |
+| `OR3_STORAGE_S3_ENDPOINT` | No | AWS default | Custom HTTP(S) endpoint URL (R2, MinIO, B2), without credentials, query, or fragment. Must be HTTPS unless `OR3_STORAGE_S3_ALLOW_INSECURE_HTTP=true` |
 | `OR3_STORAGE_S3_SESSION_TOKEN` | No | — | Session token for temporary credentials |
 | `OR3_STORAGE_S3_FORCE_PATH_STYLE` | No | `false` | Use path-style URLs instead of virtual-hosted. Required by MinIO and many S3-compatible hosts |
 | `OR3_STORAGE_S3_KEY_PREFIX` | No | `''` | Key prefix inside the bucket. Leading/trailing slashes are trimmed and a trailing slash is added |
@@ -70,7 +70,7 @@ The adapter only registers when the host app has auth and storage enabled and th
 Notes:
 
 - A missing required `OR3_STORAGE_S3_*` variable is a startup error when the `s3` provider is selected (for example `Missing OR3_STORAGE_S3_BUCKET.`).
-- `OR3_STORAGE_S3_ENDPOINT` must be a valid URL. An empty value is allowed (uses the AWS default endpoint).
+- `OR3_STORAGE_S3_ENDPOINT` must be an HTTP(S) URL without embedded credentials, query parameters, or a fragment. Unsupported schemes and credential-bearing endpoints fail startup. An empty value is allowed (uses the AWS default endpoint).
 - `OR3_STORAGE_S3_URL_TTL_SECONDS` values outside 1–3600 are rejected at startup.
 - `OR3_S3_INTEGRATION_TESTS=true` enables the optional MinIO round-trip test suite only. It is not a runtime setting.
 
@@ -90,7 +90,8 @@ Client
   │
   ├─ POST /api/storage/commit           ──► commit(): HEAD the object, verify
   │                                        size, MIME, checksum, intent expiry,
-  │                                        then write <key>.meta.json marker
+  │                                        consume the reserved intent, then
+  │                                        write <key>.meta.json marker
   │
   ├─ POST /api/storage/presign-download ──► host endpoint verifies live canonical
   │                                        metadata; presignDownload() verifies the
@@ -115,12 +116,12 @@ Keys are derived, not client-chosen. The object key is always `<prefix><workspac
 - **Server-only credentials.** The `S3Client` is built with your access key and secret inside the Nitro server. The browser only ever receives signed URLs.
 - **Short-lived URLs.** Signed URLs default to 15 minutes. The hard cap is one hour, even if a caller asks for longer.
 - **Operation scope.** A signed `PUT` URL can only upload; a signed `GET` URL can only download. The host endpoint requires live canonical workspace metadata, and the adapter additionally requires both the blob and commit marker before signing.
-- **Key validation.** Workspace IDs must match `[a-zA-Z0-9_-]+` and hashes must be canonical `sha256:<64 hex>`. A caller-supplied `storage_id` that does not match the derived key is rejected with 400 on download, commit, and delete.
-- **Upload binding.** Presigned uploads require the declared `Content-Length` and an `x-amz-checksum-sha256` header. Commit verifies the stored object's size, MIME type, checksum, workspace/hash/intent metadata, and intent expiry (410 when expired). A mismatch fails the commit without deleting the stored blob; a malformed request must not erase a previously committed object.
+- **Key validation.** Workspace IDs must match `[a-zA-Z0-9_-]+`. SHA-256 hashes may use uppercase or lowercase hex, with or without the `sha256:` prefix; they are normalized to lowercase `sha256:<64 hex>` in object keys, upload metadata, checksums, and reservations. This matches the host's canonical download lookup. A caller-supplied `storage_id` that does not match the derived key is rejected with 400 on download, commit, and delete.
+- **Upload binding.** Presigned uploads require the declared `Content-Length` and an `x-amz-checksum-sha256` header. Commit verifies the stored object's size, MIME type, checksum, and workspace/hash/intent metadata. A paired sync provider enforces the original reservation expiry for both active and consumed intents. After expiry, obtain a fresh presign and upload again before committing its new intent. Without paired intent support, commit enforces the signed metadata expiry (410 when expired). A mismatch fails the commit without deleting the stored blob; a malformed request must not erase a previously committed object.
 - **Safe downloads.** The host supplies canonical response overrides. Generic or active content is signed as an `application/octet-stream` attachment; supported raster images and PDFs may remain inline. S3 direct responses cannot add `X-Content-Type-Options`, so the attachment/octet-stream policy is applied in the signed request.
 - **Empty files.** Zero-byte uploads are accepted when the signed size and checksum match.
-- **Single commit.** The commit marker is written with `IfNoneMatch: *`, so a commit succeeds exactly once. A duplicate commit returns 409.
-- **Intent model.** Uploads are tied to a server-issued `intent_id`. Optional workspace quotas require the active sync provider to support atomic upload-intent reservation; without it, a quota request fails with 503 rather than silently skipping the check.
+- **Retry-safe commit.** The commit marker is written with `IfNoneMatch: *`. Concurrent commits, retries within the original intent lifetime after a transient sync/marker failure, and a newly verified upload of the same content succeed when the existing marker matches the workspace, canonical hash, storage ID, size, and normalized MIME. A conflicting marker returns 409. Failed intent consumption cannot create a marker.
+- **Intent model.** Uploads are tied to a server-issued `intent_id`. Sync providers must implement both reservation and consumption or neither; partial support fails upload and commit with 503 before signing or accessing S3. Optional workspace quotas require the complete pair. Without either capability, uploads remain available only without a hard workspace quota. Providers that consume reservations must retain an exact consumed receipt and accept an identical retry until its original expiry without consuming it again; expired or changed intent tuples must fail.
 - **Size cap.** Uploads larger than 100 MB are rejected with 413 before any URL is signed.
 - **HTTPS by default.** Plain-HTTP endpoints fail startup unless `OR3_STORAGE_S3_ALLOW_INSECURE_HTTP=true` is set explicitly (local development only).
 
@@ -178,7 +179,13 @@ Additional scripts: `bun run lint` and `bun run type-check:standalone`.
 CI runs the live suite against disposable MinIO on every PR and main/tag qualification
 and uploads a JSON test report. The suite verifies image/PDF/generic and zero-byte
 round trips, pending-download denial, safe response headers, failed-commit blob
-preservation, and disabled destructive deletion/GC.
+preservation, canonical downloads after uppercase/bare SHA-256 uploads, and
+disabled destructive deletion/GC. It also verifies commit retries across transient
+sync and marker-write failures, concurrent commits, repeated uploads, and conflicting
+marker rejection, expired-active/consumed denial, and fresh-upload recovery after expiry.
+Sync-provider tests own durable receipt matching; the S3 suite uses a paired in-memory
+reservation fixture and injects transient sync failure at that boundary while using
+real MinIO objects and markers.
 
 The CI fixture builds official [MinIO RELEASE.2025-10-15T17-29-55Z](https://github.com/minio/minio/releases/tag/RELEASE.2025-10-15T17-29-55Z)
 from commit `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a` using the digest-pinned
@@ -213,9 +220,9 @@ The report is a repeatable verification artifact; this suite does not exercise b
 | Commit: `Uploaded file not found` (404) | Nothing was uploaded, often because the browser PUT was blocked | Check bucket CORS and that the client sent the returned headers |
 | Commit: `Uploaded object checksum mismatch` / `size mismatch` / `content-type mismatch` (400) | Bytes, size, or MIME changed between presign and PUT | Re-upload using the exact size and type from presign; the stored object is preserved |
 | Commit: `Upload intent expired` (410) | Commit happened after the upload URL expired | Presign again and upload before the TTL passes |
-| Commit: `Upload intent already consumed` (409) | The same upload was committed twice | Treat as success; the first commit won the race |
+| Commit: `Committed object metadata does not match upload` (409) | An existing commit marker does not match the verified object | Check bucket contents and the configured key prefix; matching retries succeed automatically |
 | Upload: 413 `Upload exceeds ... byte limit` | File larger than 100 MB | Keep uploads under the 100 MB cap |
-| Quota request fails with 503 | Workspace quota needs atomic reservation support from the sync provider | Use a sync provider that exposes `reserveUploadIntent`, or skip the quota field |
+| Upload or commit fails with 503 for intent support | Workspace quota needs paired reservation/consumption support, or the sync provider exposes only one half | Configure a provider implementing both `reserveUploadIntent` and `consumeUploadIntent`; neither is allowed only without a hard quota |
 | Download fails with a signature error | Clock skew or a URL used after expiry | Check server/client clocks; presign a fresh URL |
 | `S3 HEAD failed` / `S3 commit marker write failed` (502) | Endpoint, region, bucket, or credentials mismatch, or the key lacks `GetObject`/`PutObject`/`HeadObject`/`DeleteObject` permissions | Verify endpoint/region/bucket and the access key's bucket policy |
 | Uploads work but download URLs 404 | `OR3_STORAGE_S3_KEY_PREFIX` changed between upload and download | Keep the prefix stable; keys are derived from it |

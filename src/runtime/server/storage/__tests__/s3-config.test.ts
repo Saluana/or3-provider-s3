@@ -98,16 +98,23 @@ describe('s3-config', () => {
         expect(diagnostics.config.keyPrefix).toBe('or3/storage/');
     });
 
-    it('rejects invalid endpoint URL', () => {
+    it.each([
+        'not-a-url',
+        'ftp://storage.example',
+        'file:///tmp/storage',
+        'https://access:secret@storage.example',
+        'https://storage.example?credential=secret',
+        'https://storage.example#fragment',
+    ])('rejects unsupported or credential-bearing endpoint %s', (endpoint) => {
         process.env.OR3_STORAGE_S3_REGION = 'us-east-1';
         process.env.OR3_STORAGE_S3_BUCKET = 'bucket';
         process.env.OR3_STORAGE_S3_ACCESS_KEY_ID = 'ak';
         process.env.OR3_STORAGE_S3_SECRET_ACCESS_KEY = 'sk';
-        process.env.OR3_STORAGE_S3_ENDPOINT = 'not-a-url';
+        process.env.OR3_STORAGE_S3_ENDPOINT = endpoint;
 
         const diagnostics = validateS3StorageConfig(makeRuntimeConfig());
         expect(diagnostics.isValid).toBe(false);
-        expect(diagnostics.errors).toContain('OR3_STORAGE_S3_ENDPOINT must be a valid URL.');
+        expect(diagnostics.errors.some(error => error.startsWith('OR3_STORAGE_S3_ENDPOINT '))).toBe(true);
     });
 
     it('fails closed for insecure HTTP endpoint by default', () => {

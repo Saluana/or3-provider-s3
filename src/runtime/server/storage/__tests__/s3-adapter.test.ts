@@ -18,7 +18,10 @@ vi.mock('@aws-sdk/s3-request-presigner', () => ({
     getSignedUrl: signedUrlMock,
 }));
 
-function makeAdapter(overrides: Partial<ConstructorParameters<typeof S3StorageGatewayAdapter>[0]> = {}) {
+function makeAdapter(
+    overrides: Partial<ConstructorParameters<typeof S3StorageGatewayAdapter>[0]> = {},
+    deps: NonNullable<ConstructorParameters<typeof S3StorageGatewayAdapter>[1]> = {},
+) {
     const send = vi.fn(async (command: unknown): Promise<Partial<HeadObjectCommandOutput>> => {
         if (command instanceof HeadObjectCommand) {
             return {
@@ -62,6 +65,7 @@ function makeAdapter(overrides: Partial<ConstructorParameters<typeof S3StorageGa
             now: () => 1_000_000,
             randomId: () => INTENT_ID,
             getSyncGateway: () => undefined,
+            ...deps,
         }
     );
 
@@ -125,7 +129,7 @@ describe('S3StorageGatewayAdapter', () => {
         }, {
             client: { send: vi.fn(async () => ({})) }, now: () => 1_000_000,
             randomId: () => INTENT_ID,
-            getSyncGateway: () => ({ reserveUploadIntent }),
+            getSyncGateway: () => ({ reserveUploadIntent, consumeUploadIntent: vi.fn() }),
         });
         await expect(adapter.presignUpload({} as H3Event, {
             workspaceId: 'ws1', hash: HASH, mimeType: 'image/png', sizeBytes: 3,
@@ -143,6 +147,32 @@ describe('S3StorageGatewayAdapter', () => {
             workspaceId: 'ws1', hash: HASH, mimeType: 'image/png', sizeBytes: 3,
             workspaceQuotaBytes: 100,
         })).rejects.toMatchObject({ statusCode: 503 });
+        expect(signedUrlMock).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['reserve-only', 'upload'], ['consume-only', 'upload'],
+        ['reserve-only', 'commit'], ['consume-only', 'commit'],
+    ])('rejects %s intent support before %s work', async (capability, operation) => {
+        const reserveUploadIntent = vi.fn();
+        const consumeUploadIntent = vi.fn();
+        const { adapter, send } = makeAdapter({}, {
+            getSyncGateway: () => capability === 'reserve-only'
+                ? { reserveUploadIntent } : { consumeUploadIntent },
+        });
+        const result = operation === 'upload'
+            ? adapter.presignUpload({} as H3Event, {
+                workspaceId: 'ws1', hash: HASH, mimeType: 'image/png', sizeBytes: 3,
+            })
+            : adapter.commit({} as H3Event, {
+                workspace_id: 'ws1', intent_id: INTENT_ID, hash: HASH,
+                storage_id: `ws1/${HASH}`, storage_provider_id: 's3',
+                mime_type: 'image/png', size_bytes: 3, name: 'a.png', kind: 'image',
+            });
+        await expect(result).rejects.toMatchObject({ statusCode: 503 });
+        expect(reserveUploadIntent).not.toHaveBeenCalled();
+        expect(consumeUploadIntent).not.toHaveBeenCalled();
+        expect(send).not.toHaveBeenCalled();
         expect(signedUrlMock).not.toHaveBeenCalled();
     });
 
@@ -292,6 +322,7 @@ describe('S3StorageGatewayAdapter', () => {
             {
                 client: { send },
                 now: () => 1_000_000,
+                getSyncGateway: () => undefined,
             }
         );
 
@@ -337,6 +368,7 @@ describe('S3StorageGatewayAdapter', () => {
             {
                 client: { send },
                 now: () => 1_000_000,
+                getSyncGateway: () => undefined,
             }
         );
 
@@ -391,45 +423,6 @@ describe('S3StorageGatewayAdapter', () => {
         });
         await expect(mutated.adapter.commit({} as H3Event, commitInput))
             .rejects.toMatchObject({ statusCode: 400 });
-    });
-
-    it('atomically consumes an S3 upload intent exactly once under concurrent commits', async () => {
-        let markerWritten = false;
-        const consumeUploadIntent = vi.fn(async () => undefined);
-        const send = vi.fn(async (command: unknown) => {
-            if (command instanceof HeadObjectCommand) return {
-                ContentLength: 3, ContentType: 'image/png', ChecksumSHA256: CHECKSUM,
-                Metadata: {
-                    'or3-workspace': 'ws1', 'or3-hash': HASH, 'or3-intent': INTENT_ID,
-                    'or3-intent-expires': '1000001',
-                },
-            };
-            if (command instanceof PutObjectCommand) {
-                expect(command.input.IfNoneMatch).toBe('*');
-                if (markerWritten) throw { $metadata: { httpStatusCode: 412 } };
-                markerWritten = true;
-            }
-            return {};
-        });
-        const adapter = new S3StorageGatewayAdapter({
-            region: 'us-east-1', bucket: 'bucket', accessKeyId: 'ak', secretAccessKey: 'sk',
-            forcePathStyle: false, keyPrefix: '', urlTtlSeconds: 900, requireChecksum: true,
-        }, {
-            client: { send }, now: () => 1_000_000, randomId: () => INTENT_ID,
-            getSyncGateway: () => ({ consumeUploadIntent }),
-        });
-        const input = {
-            workspace_id: 'ws1', intent_id: INTENT_ID, hash: HASH,
-            storage_id: `ws1/${HASH}`, storage_provider_id: 's3', mime_type: 'image/png',
-            size_bytes: 3, name: 'a.png', kind: 'image' as const,
-        };
-        const outcomes = await Promise.allSettled([
-            adapter.commit({} as H3Event, input),
-            adapter.commit({} as H3Event, input),
-        ]);
-        expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1);
-        expect(outcomes.filter((outcome) => outcome.status === 'rejected')).toHaveLength(1);
-        expect(consumeUploadIntent).toHaveBeenCalledTimes(1);
     });
 
     it.each([false, true])('gc is disabled even with canonical queries available=%s', async (canonicalAvailable) => {
