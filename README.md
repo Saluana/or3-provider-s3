@@ -2,6 +2,8 @@
 
 S3-compatible storage provider for [OR3 Chat](https://github.com/or3-chat/or3-chat) — blob uploads and downloads through server-signed presigned URLs.
 
+Requires **Node.js 24.22.1 or newer on the 24.x line**, matching OR3 Chat. Development and CI pin **24.22.1** in `.node-version`.
+
 ## What It Provides
 
 - Registers a server-side `StorageGatewayAdapter` with ID `s3`.
