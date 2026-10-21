@@ -220,6 +220,10 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
         return this.nowFn();
     }
 
+    get atomicUploadQuota() {
+        return getActiveSyncGatewayAdapter()?.capabilities?.atomicUploadQuota;
+    }
+
     async presignUpload(event: H3Event, input: PresignUploadRequest): Promise<PresignUploadResponse> {
         void event;
         if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0) {
@@ -318,15 +322,20 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
 
         // The marker is the provider's commit boundary. A raw object can be
         // left behind by an interrupted upload and must never be presigned.
+        let verifiedContent: PresignDownloadResponse['verifiedContent'];
         try {
             await this.clientInstance.send(new HeadObjectCommand({
                 Bucket: this.cfg.bucket,
                 Key: buildS3MarkerKey(key),
             }));
-            await this.clientInstance.send(new HeadObjectCommand({
-                Bucket: this.cfg.bucket,
-                Key: key,
+            const head = await this.clientInstance.send(new HeadObjectCommand({
+                Bucket: this.cfg.bucket, Key: key,
+                ...(input.verifyContent ? { ChecksumMode: 'ENABLED' as const } : {}),
             }));
+            if (input.verifyContent && head.ChecksumSHA256 === sha256HexToBase64Checksum(input.hash) &&
+                Number.isSafeInteger(head.ContentLength) && head.ContentLength! >= 0) {
+                verifiedContent = { hash: requireSha256Hash(input.hash), sizeBytes: head.ContentLength! };
+            }
         } catch (error) {
             if (isNotFoundError(error)) {
                 throw createError({ statusCode: 404, statusMessage: 'File not found' });
@@ -348,6 +357,7 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
         const url = await getSignedUrl(this.clientInstance as S3Client, command, { expiresIn });
 
         return {
+            ...(verifiedContent ? { verifiedContent } : {}),
             url,
             method: 'GET',
             expiresAt: this.now() + expiresIn * 1000,
