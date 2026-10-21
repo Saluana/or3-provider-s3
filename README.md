@@ -242,3 +242,20 @@ prints its selected path; restart it after provider edits. Missing repositories
 or failed builds fall back to installed packages with a warning.
 `OR3_LOCAL_PROVIDERS=false` disables local selection. Production builds use the
 installed package, so local development does not publish these changes.
+
+## Retained quota and browser cache proofs
+
+With the updated SQLite or Convex sync backend, this adapter delegates
+`atomicUploadQuota: 'retained-v1'`. The backend reserves against indexed retained
+usage plus active uploads atomically; Trash, logical deletion and intent expiry
+do not release committed charges. Same-hash restores are deduplicated. Configure
+`OR3_STORAGE_WORKSPACE_QUOTA_BYTES` explicitly (unlimited by default). Incomplete
+objects, egress and request charges are not a provider billing cap. Destructive
+S3 GC remains disabled without canonical deletion coordination.
+
+Presign-download with `verify_content: true` requests `ChecksumMode: ENABLED` on
+the existing object HEAD. Only an actual SHA-256 and content length matching the
+canonical hash produce `verifiedContent: { hash, sizeBytes }`. No object GET is
+added. Missing or mismatched checksums omit the proof, so browser eviction falls
+back to full-byte verification. SSE-KMS permissions required for checksum HEAD
+also apply here. Ordinary downloads continue to verify received bytes.

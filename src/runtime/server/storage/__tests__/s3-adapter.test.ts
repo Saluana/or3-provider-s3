@@ -176,6 +176,19 @@ describe('S3StorageGatewayAdapter', () => {
         expect(signedUrlMock).not.toHaveBeenCalled();
     });
 
+    // A HEAD proof must use the object-store checksum, never mutable metadata.
+    it.each([true, false])('attests only matching object checksums (valid=%s)', async valid => {
+        const { adapter, send } = makeAdapter();
+        const original = send.getMockImplementation()!;
+        send.mockImplementation(async command => {
+            const result = await original(command);
+            return { ...result, ChecksumSHA256: command instanceof HeadObjectCommand && command.input.ChecksumMode === 'ENABLED'
+                ? (valid ? CHECKSUM : 'wrong-checksum') : undefined };
+        });
+        const result = await adapter.presignDownload({} as H3Event, { workspaceId: 'ws1', hash: HASH, verifyContent: true });
+        expect(result.verifiedContent).toEqual(valid ? { hash: HASH, sizeBytes: 3 } : undefined);
+    });
+
     it('presigns download with canonical safe response headers', async () => {
         const { adapter } = makeAdapter();
         const result = await adapter.presignDownload({} as H3Event, {
