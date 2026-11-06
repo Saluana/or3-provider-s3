@@ -19,9 +19,10 @@ import type {
 } from '~~/server/storage/gateway/types';
 import type { SyncGatewayAdapter } from '~~/server/sync/gateway/types';
 import { getActiveSyncGatewayAdapter } from '~~/server/sync/gateway/registry';
-import { assertValidWorkspaceId, buildS3MarkerKey, buildS3ObjectKey, requireSha256Hash, sha256HexToBase64Checksum } from './s3-keys';
+import { assertValidWorkspaceId, buildS3MarkerKey, buildS3ObjectKey, requireS3Hash, hashToBase64Checksum } from './s3-keys';
 import { validateS3StorageConfig } from './s3-config';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { observeS3StorageUsage } from './s3-storage-usage';
 
 type CommitInput = {
     workspace_id: string;
@@ -82,7 +83,7 @@ function parseCommitInput(input: unknown): CommitInput {
     return {
         workspace_id: assertString(obj.workspace_id, 'Invalid workspace_id'),
         intent_id: assertString(obj.intent_id, 'Invalid intent_id'),
-        hash: requireSha256Hash(assertString(obj.hash, 'Invalid hash')),
+        hash: requireS3Hash(assertString(obj.hash, 'Invalid hash')),
         storage_id: assertString(obj.storage_id, 'Invalid storage_id'),
         storage_provider_id: assertString(obj.storage_provider_id, 'Invalid storage_provider_id'),
         mime_type: assertString(obj.mime_type, 'Invalid mime_type'),
@@ -152,7 +153,7 @@ function resolveDownloadHeaders(input: PresignDownloadRequest): {
     return { mimeType, disposition, filename };
 }
 
-const MAX_UPLOAD_SIZE_BYTES = 100 * 1024 * 1024;
+const MAX_UPLOAD_SIZE_BYTES = 1024 * 1024 * 1024;
 
 function isNotFoundError(error: unknown): boolean {
     const e = error as { name?: string; $metadata?: { httpStatusCode?: number } };
@@ -181,7 +182,7 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
     private readonly nowFn: () => number;
     private readonly getSyncGatewayFn: () => Pick<
         SyncGatewayAdapter,
-        'queryCanonicalStorage' | 'reserveUploadIntent' | 'consumeUploadIntent' | 'cancelUploadIntent'
+        'capabilities' | 'queryCanonicalStorage' | 'reserveUploadIntent' | 'consumeUploadIntent' | 'cancelUploadIntent'
     > | undefined;
     private readonly randomIdFn: () => string;
 
@@ -192,7 +193,7 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
             now?: () => number;
             getSyncGateway?: () => Pick<
                 SyncGatewayAdapter,
-                'queryCanonicalStorage' | 'reserveUploadIntent' | 'consumeUploadIntent' | 'cancelUploadIntent'
+                'capabilities' | 'queryCanonicalStorage' | 'reserveUploadIntent' | 'consumeUploadIntent' | 'cancelUploadIntent'
             > | undefined;
             randomId?: () => string;
         }
@@ -208,6 +209,9 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
             region: this.cfg.region,
             endpoint: this.cfg.endpoint,
             forcePathStyle: this.cfg.forcePathStyle,
+            // The caller supplies the checksum. Do not invent CRC32 for the
+            // presigner's absent Body when a legacy upload uses Content-MD5.
+            requestChecksumCalculation: 'WHEN_REQUIRED',
             credentials: {
                 accessKeyId: this.cfg.accessKeyId,
                 secretAccessKey: this.cfg.secretAccessKey,
@@ -224,6 +228,34 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
         return getActiveSyncGatewayAdapter()?.capabilities?.atomicUploadQuota;
     }
 
+    async observeUsage(event: H3Event, workspaceId: string, payload?: Record<string, unknown>) {
+        return observeS3StorageUsage(event, workspaceId, this.cfg, this.clientInstance, this.getSyncGatewayFn(), payload);
+    }
+
+    /** Legacy identities cannot be verified from ETag (multipart/encrypted
+     * objects differ). Hash a bounded stream before consuming any reservation. */
+    private async verifyLegacyObject(key: string, hash: string, size: number, etag?: string): Promise<boolean> {
+        if (!Number.isSafeInteger(size) || size < 0 || size > MAX_UPLOAD_SIZE_BYTES) return false;
+        const object = await this.clientInstance.send(new GetObjectCommand({ Bucket: this.cfg.bucket, Key: key, IfMatch: etag }));
+        if (!object.Body) return false;
+        const reader = object.Body.transformToWebStream().getReader();
+        const digest = createHash('md5');
+        let bytes = 0;
+        try {
+            for (;;) {
+                const chunk = await reader.read();
+                if (chunk.done) break;
+                bytes += chunk.value.byteLength;
+                if (bytes > size) return false;
+                digest.update(chunk.value);
+            }
+            return bytes === size && `md5:${digest.digest('hex')}` === hash;
+        } finally {
+            await reader.cancel().catch(() => {});
+            reader.releaseLock();
+        }
+    }
+
     async presignUpload(event: H3Event, input: PresignUploadRequest): Promise<PresignUploadResponse> {
         void event;
         if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0) {
@@ -232,7 +264,8 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
         if (input.sizeBytes > MAX_UPLOAD_SIZE_BYTES) {
             throw createError({ statusCode: 413, statusMessage: `Upload exceeds ${MAX_UPLOAD_SIZE_BYTES} byte limit` });
         }
-        const hash = requireSha256Hash(input.hash);
+        const hash = requireS3Hash(input.hash);
+        const legacy = hash.startsWith('md5:');
         const key = buildS3ObjectKey({
             keyPrefix: this.cfg.keyPrefix,
             workspaceId: input.workspaceId,
@@ -268,7 +301,7 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
             Key: key,
             ContentType: input.mimeType,
             ContentLength: input.sizeBytes,
-            ChecksumSHA256: sha256HexToBase64Checksum(hash),
+            ...(legacy ? { ContentMD5: hashToBase64Checksum(hash) } : { ChecksumSHA256: hashToBase64Checksum(hash) }),
             Metadata: {
                 'or3-hash': hash,
                 'or3-workspace': input.workspaceId,
@@ -279,7 +312,9 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
 
         let url: string;
         try {
-            url = await getSignedUrl(this.clientInstance as S3Client, command, { expiresIn });
+            url = await getSignedUrl(this.clientInstance as S3Client, command, {
+                expiresIn, unhoistableHeaders: new Set(['x-amz-checksum-sha256']),
+            });
         } catch (error) {
             if (sync?.cancelUploadIntent) {
                 await sync.cancelUploadIntent(event, {
@@ -293,7 +328,7 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
         const headers: Record<string, string> = {
             'Content-Type': input.mimeType,
             'Content-Length': String(input.sizeBytes),
-            'x-amz-checksum-sha256': sha256HexToBase64Checksum(hash),
+            [legacy ? 'Content-MD5' : 'x-amz-checksum-sha256']: hashToBase64Checksum(hash),
         };
 
         return {
@@ -308,6 +343,7 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
 
     async presignDownload(event: H3Event, input: PresignDownloadRequest): Promise<PresignDownloadResponse> {
         void event;
+        const hash = requireS3Hash(input.hash);
         const derivedKey = buildS3ObjectKey({
             keyPrefix: this.cfg.keyPrefix,
             workspaceId: input.workspaceId,
@@ -332,9 +368,13 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
                 Bucket: this.cfg.bucket, Key: key,
                 ...(input.verifyContent ? { ChecksumMode: 'ENABLED' as const } : {}),
             }));
-            if (input.verifyContent && head.ChecksumSHA256 === sha256HexToBase64Checksum(input.hash) &&
-                Number.isSafeInteger(head.ContentLength) && head.ContentLength! >= 0) {
-                verifiedContent = { hash: requireSha256Hash(input.hash), sizeBytes: head.ContentLength! };
+            // Presigning must remain metadata-only. Legacy MD5 downloads are
+            // verified by the receiving client instead of streaming the entire
+            // object through this server to issue a URL.
+            if (input.verifyContent && hash.startsWith('sha256:') &&
+                Number.isSafeInteger(head.ContentLength) && head.ContentLength! >= 0 &&
+                head.ChecksumSHA256 === hashToBase64Checksum(hash)) {
+                verifiedContent = { hash, sizeBytes: head.ContentLength! };
             }
         } catch (error) {
             if (isNotFoundError(error)) {
@@ -430,8 +470,10 @@ export class S3StorageGatewayAdapter implements StorageGatewayAdapter {
         if (!Number.isFinite(intentExpiresAt) || (!supportsIntents && intentExpiresAt <= this.now())) {
             throw createError({ statusCode: 410, statusMessage: 'Upload intent expired' });
         }
-        const expectedChecksum = sha256HexToBase64Checksum(body.hash);
-        if (head.ChecksumSHA256 !== expectedChecksum) {
+        const validChecksum = body.hash.startsWith('md5:')
+            ? await this.verifyLegacyObject(derivedKey, body.hash, expectedSize, head.ETag)
+            : head.ChecksumSHA256 === hashToBase64Checksum(body.hash);
+        if (!validChecksum) {
             throw createError({ statusCode: 400, statusMessage: 'Uploaded object checksum mismatch' });
         }
 

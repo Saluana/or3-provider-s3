@@ -29,7 +29,7 @@ jobs:
       # commit SHA. The default is the current coordinated Chat revision.
       - name: Validate OR3 Chat contract reference
         env:
-          CONTRACT_REF: ${{ vars.OR3_CHAT_CONTRACT_REF || '0bacbd46868c9c9be6cb242eb42f8bacd30bc1f9' }}
+          CONTRACT_REF: ${{ vars.OR3_CHAT_CONTRACT_REF || '4aa90134c22877add35a219a3cd957f1cf63e911' }}
         run: |
           if ! [[ "$CONTRACT_REF" =~ ^[0-9a-f]{40}$ ]]; then
             echo 'OR3_CHAT_CONTRACT_REF must be a 40-character commit SHA.' >&2
@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: Saluana/or3-chat
-          ref: ${{ vars.OR3_CHAT_CONTRACT_REF || '0bacbd46868c9c9be6cb242eb42f8bacd30bc1f9' }}
+          ref: ${{ vars.OR3_CHAT_CONTRACT_REF || '4aa90134c22877add35a219a3cd957f1cf63e911' }}
           path: or3-chat
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -100,17 +100,31 @@ jobs:
           set -euo pipefail
           bun -e 'import {S3Client, CreateBucketCommand} from "@aws-sdk/client-s3"; const client = new S3Client({endpoint: process.env.OR3_STORAGE_S3_ENDPOINT, region: process.env.OR3_STORAGE_S3_REGION, forcePathStyle: true, credentials: {accessKeyId: process.env.OR3_STORAGE_S3_ACCESS_KEY_ID, secretAccessKey: process.env.OR3_STORAGE_S3_SECRET_ACCESS_KEY}}); await client.send(new CreateBucketCommand({Bucket: process.env.OR3_STORAGE_S3_BUCKET})); client.destroy();'
           bun run test src/runtime/server/storage/__tests__/minio.integration.test.ts --reporter=dot --reporter=json --outputFile="$RUNNER_TEMP/s3-integration.json"
+      - run: bun run build
+      - name: Verify immutable generations against published SQLite
+        run: |
+          set -euo pipefail
+          env_file="$RUNNER_TEMP/generation-fixture.env"
+          cat > "$env_file" <<'ENV'
+          OR3_STORAGE_S3_ENDPOINT=http://127.0.0.1:19091
+          OR3_STORAGE_S3_REGION=us-east-1
+          OR3_STORAGE_S3_ACCESS_KEY_ID=or3-local-test
+          OR3_STORAGE_S3_SECRET_ACCESS_KEY=or3-disposable-test-secret
+          ENV
+          OR3_GENERATION_TEST_ENV="$env_file" OR3_PROJECT_HOST_ROOT="$GITHUB_WORKSPACE/or3-chat" \
+            OR3_S3_ARTIFACT_ROOT="$PWD" bun run test:e2e:generations
       - name: Save S3 compatibility evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: s3-integration-evidence
-          path: ${{ runner.temp }}/s3-integration.json
+          path: |
+            ${{ runner.temp }}/s3-integration.json
+            provider/output/generation-qualification.json
           if-no-files-found: warn
       - name: Remove disposable S3 server
         if: always()
         run: docker rm -f or3-s3-ci || true
-      - run: bun run build
       - name: Validate package archive
         run: npm pack --dry-run --json > "$RUNNER_TEMP/package-pack.json"
       - name: Create publish archive

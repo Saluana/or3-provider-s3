@@ -20,13 +20,13 @@ export interface RuntimeConfigLike {
             provider?: string;
             [key: string]: unknown;
         };
-        sync?: {
+        sync: {
             provider?: string;
             [key: string]: unknown;
         };
         [key: string]: unknown;
     };
-    sync?: {
+    sync: {
         provider?: string;
         [key: string]: unknown;
     };

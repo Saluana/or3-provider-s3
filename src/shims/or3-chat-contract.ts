@@ -3,6 +3,16 @@
 
 export type DeleteObjectRequest<T = any, U = any, V = any, W = any, X = any> = any;
 export const DeleteObjectRequest: any = undefined;
+export type DownloadPolicy<T = any, U = any, V = any, W = any, X = any> = any;
+export const DownloadPolicy: any = undefined;
+export type ExternalStorageGenerationCoordinatorV1<T = any, U = any, V = any, W = any, X = any> = any;
+export const ExternalStorageGenerationCoordinatorV1: any = undefined;
+export type ExternalStorageGenerationUploadClaimKey<T = any, U = any, V = any, W = any, X = any> = any;
+export const ExternalStorageGenerationUploadClaimKey: any = undefined;
+export type ExternalStorageGenerationUploadCoordinatorV1<T = any, U = any, V = any, W = any, X = any> = any;
+export const ExternalStorageGenerationUploadCoordinatorV1: any = undefined;
+export type ExternalStorageGenerationUploadIntent<T = any, U = any, V = any, W = any, X = any> = any;
+export const ExternalStorageGenerationUploadIntent: any = undefined;
 export type getActiveSyncGatewayAdapter<T = any, U = any, V = any, W = any, X = any> = any;
 export const getActiveSyncGatewayAdapter: any = undefined;
 export type PresignDownloadRequest<T = any, U = any, V = any, W = any, X = any> = any;
@@ -19,6 +29,14 @@ export type registerProviderAdminAdapter<T = any, U = any, V = any, W = any, X =
 export const registerProviderAdminAdapter: any = undefined;
 export type registerStorageGatewayAdapter<T = any, U = any, V = any, W = any, X = any> = any;
 export const registerStorageGatewayAdapter: any = undefined;
+export type requireCan<T = any, U = any, V = any, W = any, X = any> = any;
+export const requireCan: any = undefined;
+export type requireExternalStorageGenerationUploadCoordinator<T = any, U = any, V = any, W = any, X = any> = any;
+export const requireExternalStorageGenerationUploadCoordinator: any = undefined;
+export type resolveDownloadPolicy<T = any, U = any, V = any, W = any, X = any> = any;
+export const resolveDownloadPolicy: any = undefined;
+export type resolveSessionContext<T = any, U = any, V = any, W = any, X = any> = any;
+export const resolveSessionContext: any = undefined;
 export type StorageGatewayAdapter<T = any, U = any, V = any, W = any, X = any> = any;
 export const StorageGatewayAdapter: any = undefined;
 export type SyncGatewayAdapter<T = any, U = any, V = any, W = any, X = any> = any;

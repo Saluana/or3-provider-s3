@@ -106,7 +106,7 @@ describe('S3StorageGatewayAdapter', () => {
             workspaceId: 'ws1',
             hash: HASH,
             mimeType: 'application/octet-stream',
-            sizeBytes: 100 * 1024 * 1024 + 1,
+            sizeBytes: 1024 * 1024 * 1024 + 1,
         })).rejects.toMatchObject({ statusCode: 413 });
         expect(signedUrlMock).not.toHaveBeenCalled();
     });
@@ -119,6 +119,27 @@ describe('S3StorageGatewayAdapter', () => {
             mimeType: 'application/octet-stream',
             sizeBytes: 0,
         })).resolves.toMatchObject({ method: 'PUT', storageId: `ws1/${HASH}` });
+    });
+
+    it('accepts the host policy ceiling of 1 GiB', async () => {
+        const { adapter } = makeAdapter();
+        await expect(adapter.presignUpload({} as H3Event, {
+            workspaceId: 'ws1', hash: HASH, mimeType: 'application/octet-stream',
+            sizeBytes: 1024 * 1024 * 1024,
+        })).resolves.toMatchObject({ method: 'PUT' });
+    });
+
+    // A failed signature must not leave the workspace charged for an unusable URL.
+    it('cancels its reservation when signing fails', async () => {
+        const cancelUploadIntent = vi.fn(async () => undefined);
+        const { adapter } = makeAdapter({}, { getSyncGateway: () => ({
+            reserveUploadIntent: vi.fn(), consumeUploadIntent: vi.fn(), cancelUploadIntent,
+        }) });
+        signedUrlMock.mockRejectedValueOnce(new Error('signing failed'));
+        await expect(adapter.presignUpload({} as H3Event, {
+            workspaceId: 'ws1', hash: HASH, mimeType: 'image/png', sizeBytes: 3,
+        })).rejects.toThrow('signing failed');
+        expect(cancelUploadIntent).toHaveBeenCalledWith(expect.anything(), { workspaceId: 'ws1', intentId: INTENT_ID });
     });
 
     it('persists quota reservation before signing and binds the returned intent', async () => {
@@ -177,7 +198,11 @@ describe('S3StorageGatewayAdapter', () => {
     });
 
     // A HEAD proof must use the object-store checksum, never mutable metadata.
-    it.each([true, false])('attests only matching object checksums (valid=%s)', async valid => {
+    it.each([
+        { hash: HASH, valid: true },
+        { hash: HASH, valid: false },
+        { hash: `md5:${'a'.repeat(32)}`, valid: false },
+    ])('attests only matching SHA-256 checksums without reading object bytes ($hash, valid=$valid)', async ({ hash, valid }) => {
         const { adapter, send } = makeAdapter();
         const original = send.getMockImplementation()!;
         send.mockImplementation(async command => {
@@ -185,8 +210,9 @@ describe('S3StorageGatewayAdapter', () => {
             return { ...result, ChecksumSHA256: command instanceof HeadObjectCommand && command.input.ChecksumMode === 'ENABLED'
                 ? (valid ? CHECKSUM : 'wrong-checksum') : undefined };
         });
-        const result = await adapter.presignDownload({} as H3Event, { workspaceId: 'ws1', hash: HASH, verifyContent: true });
-        expect(result.verifiedContent).toEqual(valid ? { hash: HASH, sizeBytes: 3 } : undefined);
+        const result = await adapter.presignDownload({} as H3Event, { workspaceId: 'ws1', hash, verifyContent: true });
+        expect(result.verifiedContent).toEqual(valid ? { hash, sizeBytes: 3 } : undefined);
+        expect(send.mock.calls.some(([command]) => command instanceof GetObjectCommand)).toBe(false);
     });
 
     it('presigns download with canonical safe response headers', async () => {

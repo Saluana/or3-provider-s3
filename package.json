@@ -1,11 +1,11 @@
 {
     "name": "or3-provider-s3",
-    "version": "0.0.14",
+    "version": "0.0.15",
     "repository": {
         "type": "git",
         "url": "git+https://github.com/Saluana/or3-provider-s3.git"
     },
-    "description": "S3-compatible storage provider for OR3 Chat — server-signed presigned URLs via StorageGatewayAdapter.",
+    "description": "S3-compatible storage provider for OR3 Chat \u2014 server-signed presigned URLs via StorageGatewayAdapter.",
     "license": "MIT",
     "type": "module",
     "engines": {
@@ -31,10 +31,11 @@
     "scripts": {
         "prepack": "bun run build",
         "build": "nuxt-module-build build",
-    "lint": "eslint . --max-warnings=0",
-    "type-check": "tsc --noEmit",
-    "type-check:standalone": "tsc -p tsconfig.release.json --noEmit",
-    "test": "vitest run"
+        "lint": "eslint . --max-warnings=0",
+        "type-check": "tsc --noEmit",
+        "type-check:standalone": "tsc -p tsconfig.release.json --noEmit",
+        "test": "vitest run",
+        "test:e2e:generations": "vitest run --config vitest.generations.config.ts --reporter=dot --reporter=json --outputFile.json=output/generation-qualification.json"
     },
     "publishConfig": {
         "access": "public",
@@ -57,6 +58,7 @@
         "pathe": "^2.0.3",
         "typescript": "^5.9.3",
         "typescript-eslint": "^8.46.2",
-        "vitest": "^4.1.12"
+        "vitest": "^4.1.12",
+        "or3-provider-sqlite": "0.0.27"
     }
 }

@@ -29,13 +29,18 @@ export const s3StorageAdminAdapter: ProviderAdminAdapter = {
             actions: [{
                 id: 'storage.gc', label: 'Check Storage GC Status',
                 description: 'Reports that destructive GC is disabled; does not list or delete S3 objects.',
+            }, {
+                id: 'storage.usage', label: 'Storage usage',
+                description: 'See workspace storage usage, including files in Trash. This check does not delete files or free up space.',
             }],
         };
     },
     async runAction(event, actionId, payload, ctx) {
-        if (actionId !== 'storage.gc') throw createError({ statusCode: 400, statusMessage: 'Unknown action' });
+        if (actionId !== 'storage.gc' && actionId !== 'storage.usage') throw createError({ statusCode: 400, statusMessage: 'Unknown action' });
         if (!ctx.session.workspace?.id) throw createError({ statusCode: 400, statusMessage: 'Workspace not resolved' });
-        return createS3StorageGatewayAdapter().gc(event, {
+        const adapter = createS3StorageGatewayAdapter();
+        if (actionId === 'storage.usage') return adapter.observeUsage(event, ctx.session.workspace.id, payload);
+        return adapter.gc(event, {
             workspace_id: ctx.session.workspace.id,
             retention_seconds: payload?.retentionSeconds ?? 30 * 24 * 3600,
             limit: payload?.limit,

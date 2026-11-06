@@ -48,6 +48,9 @@ describeMinioIntegration('minio integration (opt-in)', () => {
         { mimeType: 'image/png', kind: 'image' as const, content: 'or3-s3-image', disposition: 'inline', hashForm: 'uppercase' },
         { mimeType: 'application/pdf', kind: 'pdf' as const, content: 'or3-s3-pdf', disposition: 'inline', hashForm: 'bare' },
         { mimeType: 'text/plain', kind: 'file' as const, content: '', disposition: 'attachment', hashForm: 'canonical' },
+        { mimeType: 'text/plain', kind: 'file' as const, content: 'legacy backup original', disposition: 'attachment', hashForm: 'md5' },
+        { mimeType: 'text/plain', kind: 'file' as const, content: '', disposition: 'attachment', hashForm: 'md5' },
+        { mimeType: 'application/octet-stream', kind: 'file' as const, content: '', disposition: 'attachment', hashForm: 'large' },
     ])('presign → PUT → commit → canonical GET for $mimeType ($hashForm hash)', async ({ mimeType, kind, content, disposition, hashForm }) => {
         const endpoint = maybeEnv('OR3_STORAGE_S3_ENDPOINT');
         const region = envOrThrow('OR3_STORAGE_S3_REGION');
@@ -57,6 +60,7 @@ describeMinioIntegration('minio integration (opt-in)', () => {
         const sessionToken = maybeEnv('OR3_STORAGE_S3_SESSION_TOKEN');
 
         const client = new S3Client({
+            requestChecksumCalculation: 'WHEN_REQUIRED',
             region,
             endpoint,
             forcePathStyle: process.env.OR3_STORAGE_S3_FORCE_PATH_STYLE === 'true',
@@ -121,8 +125,9 @@ describeMinioIntegration('minio integration (opt-in)', () => {
         );
 
         // The provider validates the hash, size and MIME, not the file format.
-        const bytes = new TextEncoder().encode(content);
-        const canonicalHash = sha256HashOf(bytes);
+        const bytes = hashForm === 'large' ? new Uint8Array(128 * 1024 * 1024).fill(17) : new TextEncoder().encode(content);
+        const canonicalHash = hashForm === 'md5'
+            ? `md5:${createHash('md5').update(bytes).digest('hex')}` : sha256HashOf(bytes);
         const hash = hashForm === 'uppercase' ? canonicalHash.toUpperCase()
             : hashForm === 'bare' ? canonicalHash.slice('sha256:'.length) : canonicalHash;
         const workspaceId = `ws_s3_test_${crypto.randomUUID().replaceAll('-', '')}`;
@@ -135,7 +140,7 @@ describeMinioIntegration('minio integration (opt-in)', () => {
         });
 
         try {
-            if (bytes.byteLength > 0) {
+            if (bytes.byteLength > 0 && hashForm !== 'large') {
                 const mutated = bytes.slice();
                 mutated[0] = mutated[0]! ^ 1;
                 const rejected = await fetch(presignUp.url, {
@@ -163,6 +168,16 @@ describeMinioIntegration('minio integration (opt-in)', () => {
                 name: 'integration',
                 kind,
             };
+            if (hashForm === 'md5' && bytes.byteLength) {
+                // Legacy verification must hash bytes, not trust ETag or mutable metadata.
+                await client.send(new PutObjectCommand({
+                    Bucket: bucket, Key: presignUp.storageId, Body: new Uint8Array(bytes.byteLength), ContentType: mimeType,
+                    Metadata: { 'or3-hash': canonicalHash, 'or3-workspace': workspaceId,
+                        'or3-intent': presignUp.intentId!, 'or3-intent-expires': String(presignUp.expiresAt) },
+                }));
+                await expect(adapter.commit({} as H3Event, commitInput)).rejects.toMatchObject({ statusCode: 400 });
+                expect((await fetch(presignUp.url, { method: 'PUT', headers: presignUp.headers, body: bytes })).ok).toBe(true);
+            }
             if (kind === 'image') {
                 // An expired active reservation cannot publish a marker.
                 now = presignUp.expiresAt! + 1;
@@ -227,7 +242,10 @@ describeMinioIntegration('minio integration (opt-in)', () => {
                 mimeType,
                 disposition,
                 filename: 'integration',
+                verifyContent: true,
             });
+            expect(presignDown.verifiedContent).toEqual(hashForm === 'md5'
+                ? undefined : { hash: canonicalHash, sizeBytes: bytes.byteLength });
 
             const getRes = await fetch(presignDown.url, {
                 method: presignDown.method ?? 'GET',
@@ -237,7 +255,7 @@ describeMinioIntegration('minio integration (opt-in)', () => {
             expect(getRes.headers.get('content-type')).toBe(kind === 'file' ? 'application/octet-stream' : mimeType);
             expect(getRes.headers.get('content-disposition')).toContain(disposition);
             const downloaded = new Uint8Array(await getRes.arrayBuffer());
-            expect(sha256HashOf(downloaded)).toBe(canonicalHash);
+            expect(sha256HashOf(downloaded)).toBe(sha256HashOf(bytes));
 
             if (kind === 'image') {
                 const repeatedUpload = await adapter.presignUpload({} as H3Event, {
@@ -278,5 +296,6 @@ describeMinioIntegration('minio integration (opt-in)', () => {
                 );
             client.destroy();
         }
-    });
+    // Includes a real 128 MiB transfer above the old provider-only ceiling.
+    }, 60_000);
 });
