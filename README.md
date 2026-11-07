@@ -309,3 +309,13 @@ Run `OR3_GENERATION_TEST_ENV=/private/path/env OR3_PROJECT_HOST_ROOT=/path/to/or
 The named lane creates and removes its own bucket and writes a JSON report under
 `output/`. Optional `OR3_S3_ARTIFACT_ROOT` and `OR3_SQLITE_ARTIFACT_ROOT` select built
 package roots. Never point destructive qualification at an existing data bucket.
+
+### Hippius generation qualification
+
+The explicit `test:e2e:generations` lane has passed ten real-network cases against
+Hippius using installed S3 0.0.15 and a recorded local SQLite development artifact.
+It creates new disposable buckets, including an unversioned refusal control;
+existing configured buckets and objects are not selected for deletion. Keep
+`OR3_GENERATION_TEST_ENV` private. Passing this protocol/accounting lane does not
+activate runtime cleanup: exact installed backup/restore/restart qualification is
+still required, and mutable legacy objects remain excluded.

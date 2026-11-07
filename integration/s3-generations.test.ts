@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseEnv } from 'node:util';
-import { S3Client, CreateBucketCommand, PutBucketVersioningCommand, ListObjectVersionsCommand, DeleteObjectCommand, DeleteBucketCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, CreateBucketCommand, PutBucketVersioningCommand, ListObjectVersionsCommand, DeleteObjectCommand, DeleteBucketCommand, HeadObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
 import { _resetForTest, destroySqliteDb, getRawDb, initializeSqliteDb } from '#sqlite-runtime/server/db/kysely';
 import { runMigrations } from '#sqlite-runtime/server/db/migrate';
 import { SqliteExternalStorageGenerationUploadCoordinator } from '#sqlite-runtime/server/storage/sqlite-generation-upload-coordinator';
@@ -90,6 +90,24 @@ it('is disabled by default, including cleanup, before any external work', async 
     await expect(disabled.allocate(spec)).rejects.toThrow('disabled');
     const noCleanup = new S3GenerationStore({ client, bucket, namespaceId: randomUUID(), enabled: true });
     await expect(noCleanup.removeGeneration(spec, 'claim', coordinator)).rejects.toThrow('disabled');
+});
+
+// The shared fixture is versioned: only a separate real unversioned bucket
+// can prove allocation refuses that unsafe configuration before publishing bytes.
+it('refuses unversioned buckets without publishing generation objects', async () => {
+    const unversionedBucket = `or3-generation-unversioned-${randomUUID().replaceAll('-', '')}`;
+    await client.send(new CreateBucketCommand({ Bucket: unversionedBucket }));
+    try {
+        const unversioned = new S3GenerationStore({ client, bucket: unversionedBucket, namespaceId: randomUUID(), enabled: true });
+        await expect(unversioned.allocate(spec)).rejects.toThrow('versioning');
+        const objects = await client.send(new ListObjectsV2Command({ Bucket: unversionedBucket, MaxKeys: 100 }));
+        expect(objects.Contents ?? []).toEqual([]);
+    } finally {
+        const objects = await client.send(new ListObjectsV2Command({ Bucket: unversionedBucket, MaxKeys: 100 }));
+        expect(objects.IsTruncated).not.toBe(true);
+        for (const object of objects.Contents ?? []) await client.send(new DeleteObjectCommand({ Bucket: unversionedBucket, Key: object.Key! }));
+        await client.send(new DeleteBucketCommand({ Bucket: unversionedBucket }));
+    }
 });
 
 it('freezes verified bytes, replays commit, and excludes concurrent/replayed uploads', async () => {
